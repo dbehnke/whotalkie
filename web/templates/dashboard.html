@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WhoTalkie PTT Dashboard</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+            color: #333;
+        }
+        .status {
+            display: flex;
+            justify-content: space-around;
+            margin-bottom: 30px;
+        }
+        .status-item {
+            text-align: center;
+            padding: 10px;
+        }
+        .status-value {
+            font-size: 24px;
+            font-weight: bold;
+            color: #4CAF50;
+        }
+        .ws-test {
+            border: 1px solid #ddd;
+            padding: 20px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+        }
+        #messages {
+            height: 200px;
+            overflow-y: auto;
+            border: 1px solid #ccc;
+            padding: 10px;
+            margin: 10px 0;
+            background: #f9f9f9;
+        }
+        input, button {
+            padding: 8px;
+            margin: 5px;
+        }
+        button {
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+        .connected { color: #4CAF50; }
+        .disconnected { color: #f44336; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>WhoTalkie PTT Dashboard</h1>
+            <p>Push-to-Talk Communication Server</p>
+        </div>
+        
+        <div class="status">
+            <div class="status-item">
+                <div class="status-value" id="server-status">Online</div>
+                <div>Server Status</div>
+            </div>
+            <div class="status-item">
+                <div class="status-value" id="active-channels">0</div>
+                <div>Active Channels</div>
+            </div>
+            <div class="status-item">
+                <div class="status-value" id="connected-users">0</div>
+                <div>Connected Users</div>
+            </div>
+        </div>
+
+        <div class="ws-test">
+            <h3>WebSocket Test</h3>
+            <div>
+                <span>Connection Status: </span>
+                <span id="ws-status" class="disconnected">Disconnected</span>
+            </div>
+            <div>
+                <input type="text" id="message-input" placeholder="Type a message..." />
+                <button onclick="sendMessage()">Send</button>
+                <button onclick="connect()">Connect</button>
+                <button onclick="disconnect()">Disconnect</button>
+            </div>
+            <div id="messages"></div>
+        </div>
+    </div>
+
+    <script>
+        let ws = null;
+        const messagesDiv = document.getElementById('messages');
+        const statusSpan = document.getElementById('ws-status');
+
+        function connect() {
+            if (ws) return;
+            
+            ws = new WebSocket('ws://localhost:8080/ws');
+            
+            ws.onopen = function() {
+                statusSpan.textContent = 'Connected';
+                statusSpan.className = 'connected';
+                addMessage('Connected to WebSocket');
+            };
+            
+            ws.onmessage = function(event) {
+                addMessage('Received: ' + event.data);
+            };
+            
+            ws.onclose = function() {
+                statusSpan.textContent = 'Disconnected';
+                statusSpan.className = 'disconnected';
+                addMessage('Disconnected from WebSocket');
+                ws = null;
+            };
+            
+            ws.onerror = function(error) {
+                addMessage('Error: ' + error);
+            };
+        }
+
+        function disconnect() {
+            if (ws) {
+                ws.close();
+            }
+        }
+
+        function sendMessage() {
+            const input = document.getElementById('message-input');
+            if (ws && input.value) {
+                ws.send(input.value);
+                addMessage('Sent: ' + input.value);
+                input.value = '';
+            }
+        }
+
+        function addMessage(message) {
+            const div = document.createElement('div');
+            div.textContent = new Date().toLocaleTimeString() + ' - ' + message;
+            messagesDiv.appendChild(div);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+
+        // Auto-connect on page load
+        window.onload = function() {
+            setTimeout(connect, 1000);
+        };
+    </script>
+</body>
+</html>
