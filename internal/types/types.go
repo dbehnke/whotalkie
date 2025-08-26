@@ -55,3 +55,11 @@ const (
 	EventAudioData    PTTEventType = "audio_data"
 	EventHeartbeat    PTTEventType = "heartbeat"
 )
+
+type ServerStats struct {
+	TotalUsers       int `json:"total_users"`
+	ActiveUsers      int `json:"active_users"`
+	TotalChannels    int `json:"total_channels"`
+	ActiveChannels   int `json:"active_channels"`
+	ConnectedClients int `json:"connected_clients"`
+}

@@ -2,12 +2,21 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"nhooyr.io/websocket"
+
+	"whotalkie/internal/state"
+	"whotalkie/internal/types"
 )
+
+var stateManager *state.Manager
 
 func handleWebSocket(c *gin.Context) {
 	conn, err := websocket.Accept(c.Writer, c.Request, &websocket.AcceptOptions{
@@ -17,28 +26,240 @@ func handleWebSocket(c *gin.Context) {
 		log.Printf("Failed to upgrade connection: %v", err)
 		return
 	}
-	defer conn.Close(websocket.StatusInternalError, "")
+	defer conn.Close(websocket.StatusNormalClosure, "")
 
-	log.Println("New WebSocket connection established")
+	userID := uuid.New().String()
+	username := fmt.Sprintf("User_%s", userID[:8])
+	
+	user := &types.User{
+		ID:       userID,
+		Username: username,
+		Channel:  "",
+		IsActive: true,
+	}
+	
+	wsConn := &types.WebSocketConnection{
+		Conn:   conn,
+		UserID: userID,
+		Send:   make(chan []byte, 256),
+	}
+	
+	stateManager.AddUser(user)
+	stateManager.AddClient(userID, wsConn)
+	
+	log.Printf("New WebSocket connection: User %s (%s)", username, userID)
+	
+	stateManager.BroadcastEvent(&types.PTTEvent{
+		Type:      string(types.EventUserJoin),
+		UserID:    userID,
+		ChannelID: "",
+		Timestamp: time.Now(),
+		Data: map[string]interface{}{
+			"username": username,
+		},
+	})
+	
+	go handleClientWrite(wsConn)
+	
+	defer func() {
+		stateManager.RemoveUser(userID)
+		stateManager.RemoveClient(userID)
+		close(wsConn.Send)
+		
+		stateManager.BroadcastEvent(&types.PTTEvent{
+			Type:      string(types.EventUserLeave),
+			UserID:    userID,
+			ChannelID: user.Channel,
+			Timestamp: time.Now(),
+			Data: map[string]interface{}{
+				"username": username,
+			},
+		})
+		
+		log.Printf("User %s (%s) disconnected", username, userID)
+	}()
+	
+	handleClientRead(wsConn)
+}
 
+func handleClientRead(wsConn *types.WebSocketConnection) {
 	ctx := context.Background()
+	
 	for {
-		_, message, err := conn.Read(ctx)
+		_, message, err := wsConn.Conn.Read(ctx)
 		if err != nil {
-			log.Printf("WebSocket read error: %v", err)
+			log.Printf("WebSocket read error for user %s: %v", wsConn.UserID, err)
 			break
 		}
-		log.Printf("Received message: %s", message)
+		
+		var event types.PTTEvent
+		if err := json.Unmarshal(message, &event); err != nil {
+			log.Printf("Failed to parse message from user %s: %v", wsConn.UserID, err)
+			continue
+		}
+		
+		event.UserID = wsConn.UserID
+		event.Timestamp = time.Now()
+		
+		handleEvent(&event)
+	}
+}
 
-		err = conn.Write(ctx, websocket.MessageText, []byte("Echo: "+string(message)))
+func handleClientWrite(wsConn *types.WebSocketConnection) {
+	ctx := context.Background()
+	
+	for {
+		select {
+		case message, ok := <-wsConn.Send:
+			if !ok {
+				return
+			}
+			
+			if err := wsConn.Conn.Write(ctx, websocket.MessageText, message); err != nil {
+				log.Printf("WebSocket write error for user %s: %v", wsConn.UserID, err)
+				return
+			}
+		}
+	}
+}
+
+func handleEvent(event *types.PTTEvent) {
+	log.Printf("Handling event: %s from user %s", event.Type, event.UserID)
+	
+	switch event.Type {
+	case string(types.EventChannelJoin):
+		handleChannelJoin(event)
+	case string(types.EventChannelLeave):
+		handleChannelLeave(event)
+	case string(types.EventPTTStart):
+		handlePTTStart(event)
+	case string(types.EventPTTEnd):
+		handlePTTEnd(event)
+	case string(types.EventHeartbeat):
+		handleHeartbeat(event)
+	default:
+		log.Printf("Unknown event type: %s", event.Type)
+	}
+}
+
+func handleChannelJoin(event *types.PTTEvent) {
+	channelID := event.ChannelID
+	if channelID == "" {
+		if channelName, ok := event.Data["channel_name"].(string); ok {
+			channelID = channelName
+		} else {
+			channelID = "general"
+		}
+		event.ChannelID = channelID
+	}
+	
+	channel := stateManager.GetOrCreateChannel(channelID, channelID)
+	if err := stateManager.JoinChannel(event.UserID, channelID); err != nil {
+		log.Printf("Failed to join channel %s: %v", channelID, err)
+		return
+	}
+	
+	user, _ := stateManager.GetUser(event.UserID)
+	event.Data = map[string]interface{}{
+		"username":     user.Username,
+		"channel_name": channel.Name,
+	}
+	
+	stateManager.BroadcastEvent(event)
+}
+
+func handleChannelLeave(event *types.PTTEvent) {
+	if err := stateManager.LeaveChannel(event.UserID, event.ChannelID); err != nil {
+		log.Printf("Failed to leave channel %s: %v", event.ChannelID, err)
+		return
+	}
+	
+	user, _ := stateManager.GetUser(event.UserID)
+	event.Data = map[string]interface{}{
+		"username": user.Username,
+	}
+	
+	stateManager.BroadcastEvent(event)
+}
+
+func handlePTTStart(event *types.PTTEvent) {
+	user, exists := stateManager.GetUser(event.UserID)
+	if !exists || user.Channel == "" {
+		return
+	}
+	
+	event.ChannelID = user.Channel
+	event.Data = map[string]interface{}{
+		"username": user.Username,
+	}
+	
+	stateManager.BroadcastEvent(event)
+}
+
+func handlePTTEnd(event *types.PTTEvent) {
+	user, exists := stateManager.GetUser(event.UserID)
+	if !exists || user.Channel == "" {
+		return
+	}
+	
+	event.ChannelID = user.Channel
+	event.Data = map[string]interface{}{
+		"username": user.Username,
+	}
+	
+	stateManager.BroadcastEvent(event)
+}
+
+func handleHeartbeat(event *types.PTTEvent) {
+	user, exists := stateManager.GetUser(event.UserID)
+	if !exists {
+		return
+	}
+	
+	response := &types.PTTEvent{
+		Type:      string(types.EventHeartbeat),
+		UserID:    event.UserID,
+		Timestamp: time.Now(),
+		Data: map[string]interface{}{
+			"status": "pong",
+			"username": user.Username,
+		},
+	}
+	
+	if client, exists := stateManager.GetClient(event.UserID); exists {
+		if responseBytes, err := json.Marshal(response); err == nil {
+			select {
+			case client.Send <- responseBytes:
+			default:
+			}
+		}
+	}
+}
+
+func broadcastEvents() {
+	for event := range stateManager.GetEventChannel() {
+		eventBytes, err := json.Marshal(event)
 		if err != nil {
-			log.Printf("WebSocket write error: %v", err)
-			break
+			log.Printf("Failed to marshal event: %v", err)
+			continue
+		}
+		
+		clients := stateManager.GetAllClients()
+		for _, client := range clients {
+			select {
+			case client.Send <- eventBytes:
+			default:
+				log.Printf("Client %s send channel full, skipping", client.UserID)
+			}
 		}
 	}
 }
 
 func main() {
+	stateManager = state.NewManager()
+	
+	go broadcastEvents()
+	
 	r := gin.Default()
 
 	r.LoadHTMLGlob("web/templates/*")
@@ -61,6 +282,21 @@ func main() {
 			"message": "WhoTalkie PTT Server",
 			"version": "0.1.0",
 		})
+	})
+	
+	r.GET("/api/stats", func(c *gin.Context) {
+		stats := stateManager.GetStats()
+		c.JSON(http.StatusOK, stats)
+	})
+	
+	r.GET("/api/users", func(c *gin.Context) {
+		users := stateManager.GetAllUsers()
+		c.JSON(http.StatusOK, gin.H{"users": users})
+	})
+	
+	r.GET("/api/channels", func(c *gin.Context) {
+		channels := stateManager.GetAllChannels()
+		c.JSON(http.StatusOK, gin.H{"channels": channels})
 	})
 
 	r.GET("/ws", handleWebSocket)
