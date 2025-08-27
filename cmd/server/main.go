@@ -110,7 +110,11 @@ func handleClientRead(wsConn *types.WebSocketConnection) {
 			if event.Type == string(types.EventAudioData) {
 				expectingAudioData = true
 				audioMetadata = &event
-				log.Printf("Expecting audio data from user %s, size: %v bytes", wsConn.UserID, event.Data["chunk_size"])
+				format := "pcm" // Default to pcm for backward compatibility
+				if f, ok := event.Data["format"].(string); ok {
+					format = f
+				}
+				log.Printf("Expecting %s audio data from user %s, size: %v bytes", format, wsConn.UserID, event.Data["chunk_size"])
 			} else {
 				handleEvent(&event)
 			}
@@ -135,8 +139,13 @@ func handleAudioData(wsConn *types.WebSocketConnection, metadata *types.PTTEvent
 		return
 	}
 
-	log.Printf("Relaying %d bytes of audio from user %s in channel %s", 
-		len(audioData), user.Username, user.Channel)
+	format := "pcm"
+	if f, ok := metadata.Data["format"].(string); ok {
+		format = f
+	}
+
+	log.Printf("Relaying %d bytes of %s audio from user %s in channel %s",
+		len(audioData), format, user.Username, user.Channel)
 
 	// Get all clients in the same channel
 	channel, exists := stateManager.GetChannel(user.Channel)
