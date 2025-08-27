@@ -262,11 +262,636 @@
         let currentChannel = '';
         let isPTTActive = false;
         
+        // Audio system variables
+        let audioContext = null;
+        let mediaStream = null;
+        let mediaRecorder = null;
+        let audioChunks = [];
+        let audioPlaybackQueue = [];
+        let isPlayingAudio = false;
+        let nextPlayTime = 0;
+        let activeAudioSources = new Map(); // Track audio sources by user ID
+        let audioMixer = null;
+        let audioMixerGain = null;
+        let userAudioBuffers = new Map(); // Store audio buffers by user ID
+        let microphonePermission = false;
+        
         const messagesDiv = document.getElementById('messages');
         const connectionStatus = document.getElementById('connection-status');
         const connectionText = document.getElementById('connection-text');
         const userInfo = document.getElementById('user-info');
         const pttButton = document.getElementById('ptt-button');
+
+        // Audio System Functions
+        async function initializeAudio() {
+            try {
+                addMessage('Requesting microphone access...');
+                
+                mediaStream = await navigator.mediaDevices.getUserMedia({ 
+                    audio: {
+                        echoCancellation: false,  // Disable for lower latency
+                        noiseSuppression: false,  // Disable for lower latency  
+                        autoGainControl: false,   // Disable for lower latency
+                        sampleRate: 44100,
+                        channelCount: 1           // Mono for efficiency
+                    } 
+                });
+                
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                microphonePermission = true;
+                
+                addMessage('✅ Microphone access granted');
+                updatePTTButtonState();
+                
+            } catch (error) {
+                addMessage('❌ Microphone access denied: ' + error.message);
+                microphonePermission = false;
+                updatePTTButtonState();
+            }
+        }
+
+        function updatePTTButtonState() {
+            if (microphonePermission && currentChannel && ws && ws.readyState === WebSocket.OPEN) {
+                pttButton.disabled = false;
+                pttButton.textContent = 'HOLD TO TALK (with audio)';
+            } else if (currentChannel && ws && ws.readyState === WebSocket.OPEN) {
+                pttButton.disabled = false;
+                pttButton.textContent = 'HOLD TO TALK (events only)';
+            } else {
+                pttButton.disabled = true;
+                pttButton.textContent = 'JOIN CHANNEL TO TALK';
+            }
+        }
+
+        function startAudioCapture() {
+            if (!microphonePermission || !mediaStream) {
+                addMessage('⚠️ No microphone access - sending PTT event only');
+                return;
+            }
+
+            try {
+                // Use Web Audio API for raw PCM capture instead of MediaRecorder
+                if (!audioContext) {
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                }
+                
+                // Resume audio context if suspended
+                if (audioContext.state === 'suspended') {
+                    audioContext.resume();
+                }
+                
+                // Create audio processing chain
+                const source = audioContext.createMediaStreamSource(mediaStream);
+                const processor = audioContext.createScriptProcessor(2048, 1, 1); // Smaller buffer for lower latency
+                
+                addMessage('🎵 Using PCM audio capture via Web Audio API');
+                addMessage('📊 Sample rate: ' + audioContext.sampleRate + 'Hz');
+                
+                processor.onaudioprocess = function(event) {
+                    const inputBuffer = event.inputBuffer;
+                    const inputData = inputBuffer.getChannelData(0); // Get mono channel
+                    
+                    // Convert Float32Array to Int16Array (PCM 16-bit)
+                    const pcmData = new Int16Array(inputData.length);
+                    for (let i = 0; i < inputData.length; i++) {
+                        // Clamp to [-1, 1] and convert to 16-bit PCM
+                        const sample = Math.max(-1, Math.min(1, inputData[i]));
+                        pcmData[i] = sample * 32767;
+                    }
+                    
+                    // Send PCM data immediately for real-time streaming
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        sendPCMAudioChunk(pcmData);
+                    }
+                };
+                
+                // Connect the audio processing chain
+                source.connect(processor);
+                processor.connect(audioContext.destination); // Connect to destination to prevent garbage collection
+                
+                // Store references for cleanup
+                window.audioSource = source;
+                window.audioProcessor = processor;
+                
+                addMessage('🎤 PCM audio capture started');
+                
+            } catch (error) {
+                addMessage('❌ Audio capture failed: ' + error.message);
+            }
+        }
+
+        function stopAudioCapture() {
+            // Clean up Web Audio API nodes
+            if (window.audioProcessor) {
+                window.audioProcessor.disconnect();
+                window.audioProcessor = null;
+                addMessage('🎤 PCM audio capture stopped');
+            }
+            
+            if (window.audioSource) {
+                window.audioSource.disconnect();
+                window.audioSource = null;
+            }
+            
+            // Reset playback timing for next session
+            nextPlayTime = 0;
+        }
+
+        function sendPCMAudioChunk(pcmData) {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                // Check size limit (8KB max for better real-time performance)
+                const byteLength = pcmData.length * 2; // Int16Array is 2 bytes per sample
+                if (byteLength > 8000) {
+                    addMessage('⚠️ PCM chunk too large: ' + byteLength + ' bytes, skipping');
+                    return;
+                }
+
+                // Send audio metadata first
+                const audioEvent = {
+                    type: 'audio_data',
+                    timestamp: new Date().toISOString(),
+                    data: {
+                        chunk_size: byteLength,
+                        format: 'pcm',
+                        sample_rate: audioContext.sampleRate,
+                        channels: 1,
+                        bit_depth: 16
+                    }
+                };
+                
+                ws.send(JSON.stringify(audioEvent));
+                
+                // Then send the binary PCM data
+                ws.send(pcmData.buffer);
+                
+                // Reduced logging for real-time performance
+                if (Math.random() < 0.05) { // Only log 5% of chunks
+                    addMessage('📤 Sent PCM chunk: ' + byteLength + ' bytes');
+                }
+            } else {
+                addMessage('❌ WebSocket not ready for audio transmission');
+            }
+        }
+
+        function sendAudioChunk(audioBlob) {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                // Check size limit (32KB max to be safe)
+                if (audioBlob.size > 30000) {
+                    addMessage('⚠️ Audio chunk too large (' + audioBlob.size + ' bytes), skipping');
+                    return;
+                }
+                
+                addMessage('📡 Sending audio chunk: ' + audioBlob.size + ' bytes');
+                
+                // Convert blob to array buffer and send as binary
+                audioBlob.arrayBuffer().then(buffer => {
+                    // Create a header with metadata
+                    // Get the actual MIME type from the MediaRecorder
+                    let actualFormat = 'webm/opus';
+                    if (mediaRecorder && mediaRecorder.mimeType) {
+                        actualFormat = mediaRecorder.mimeType;
+                    }
+                    
+                    const metadata = {
+                        type: 'audio_data',
+                        user_id: currentUser ? currentUser.id : '',
+                        channel_id: currentChannel,
+                        timestamp: new Date().toISOString(),
+                        audio_format: actualFormat,
+                        chunk_size: buffer.byteLength
+                    };
+                    
+                    addMessage('📤 Sending metadata + ' + buffer.byteLength + ' bytes audio data');
+                    
+                    // Send metadata first, then audio data
+                    ws.send(JSON.stringify(metadata));
+                    ws.send(buffer);
+                });
+            } else {
+                addMessage('❌ WebSocket not ready for audio transmission');
+            }
+        }
+
+        // Store current audio metadata for mixing
+        let currentAudioMetadata = null;
+        
+        function initializeAudioMixer() {
+            if (!audioContext) {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            }
+            
+            if (!audioMixer) {
+                // Create a gain node to control overall mixed volume
+                audioMixerGain = audioContext.createGain();
+                audioMixerGain.gain.value = 0.7; // Reduce volume to prevent clipping when mixing
+                audioMixerGain.connect(audioContext.destination);
+                
+                addMessage('🎚️ Audio mixer initialized for multi-user support');
+            }
+        }
+        
+        async function tryPlayPCMAudioWithMixing(audioData, userID) {
+            try {
+                // Initialize audio context and mixer if needed
+                if (!audioContext) {
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                }
+                
+                // Resume audio context if suspended
+                if (audioContext.state === 'suspended') {
+                    await audioContext.resume();
+                }
+                
+                // Initialize mixer if needed
+                if (!audioMixerGain) {
+                    initializeAudioMixer();
+                }
+                
+                // Convert ArrayBuffer to Int16Array (PCM 16-bit)
+                const pcmData = new Int16Array(audioData);
+                
+                if (pcmData.length === 0) {
+                    return false;
+                }
+                
+                // Create audio buffer for this user
+                const sampleRate = audioContext.sampleRate;
+                const audioBuffer = audioContext.createBuffer(1, pcmData.length, sampleRate);
+                const channelData = audioBuffer.getChannelData(0);
+                
+                // Convert Int16 PCM to Float32 for Web Audio API
+                for (let i = 0; i < pcmData.length; i++) {
+                    channelData[i] = pcmData[i] / 32767.0; // Normalize to [-1, 1]
+                }
+                
+                // Create individual gain node for this user (for volume control/mixing)
+                const userGain = audioContext.createGain();
+                userGain.gain.value = 1.0 / Math.max(1, activeAudioSources.size + 1); // Auto-adjust volume based on active speakers
+                
+                // Create and play audio source
+                const source = audioContext.createBufferSource();
+                source.buffer = audioBuffer;
+                
+                // Connect: source -> userGain -> mixerGain -> destination
+                source.connect(userGain);
+                userGain.connect(audioMixerGain);
+                
+                // Track this user's audio source
+                const sourceInfo = {
+                    source: source,
+                    gain: userGain,
+                    startTime: audioContext.currentTime
+                };
+                
+                activeAudioSources.set(userID, sourceInfo);
+                
+                // Schedule playback
+                const startTime = Math.max(audioContext.currentTime, nextPlayTime);
+                source.start(startTime);
+                
+                // Clean up when audio finishes
+                source.onended = () => {
+                    activeAudioSources.delete(userID);
+                    userGain.disconnect();
+                };
+                
+                // Update next play time for smooth continuation
+                nextPlayTime = startTime + audioBuffer.duration;
+                if (nextPlayTime < audioContext.currentTime) {
+                    nextPlayTime = audioContext.currentTime;
+                }
+                
+                return true;
+                
+            } catch (error) {
+                addMessage('⚠️ Mixed PCM playback failed: ' + error.message);
+                return false;
+            }
+        }
+        
+        async function playReceivedAudio(audioData, userID = 'unknown') {
+            try {
+                // Reduced logging for better performance
+                if (Math.random() < 0.02) { // Only log 2% of chunks
+                    addMessage('🔊 Audio chunk from ' + userID + ' (' + audioData.byteLength + ' bytes)');
+                }
+                
+                // Check if this looks like PCM data (should be divisible by 2 for 16-bit samples)
+                if (audioData.byteLength > 0 && audioData.byteLength % 2 === 0) {
+                    // Try to play as PCM with mixing support
+                    if (await tryPlayPCMAudioWithMixing(audioData, userID)) {
+                        if (Math.random() < 0.01) { // Only log 1% success messages
+                            addMessage('🎵 Mixed PCM audio from ' + userID);
+                        }
+                        return;
+                    }
+                }
+                
+                // Fallback to non-mixed playback
+                if (await tryPlayPCMAudio(audioData)) {
+                    return;
+                }
+                
+                // Convert ArrayBuffer to Uint8Array for container format handling
+                let bytes;
+                if (audioData instanceof ArrayBuffer) {
+                    bytes = new Uint8Array(audioData);
+                } else if (audioData instanceof Blob) {
+                    const arrayBuffer = await audioData.arrayBuffer();
+                    bytes = new Uint8Array(arrayBuffer);
+                } else {
+                    bytes = audioData;
+                }
+                
+                // Try to extract and play Opus audio from WebM container
+                if (await tryPlayOpusAudio(bytes)) {
+                    addMessage('🎵 Playing Opus audio successfully');
+                } else {
+                    // Fallback to creating playable WebM blob
+                    await tryPlayWebMBlob(bytes);
+                }
+                
+            } catch (error) {
+                addMessage('❌ Error handling audio: ' + error.message);
+                playAudioConfirmationBeep(); // Fallback beep
+            }
+        }
+
+        async function tryPlayPCMAudio(audioData) {
+            try {
+                // Initialize audio context if needed
+                if (!audioContext) {
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                }
+                
+                // Resume audio context if suspended
+                if (audioContext.state === 'suspended') {
+                    await audioContext.resume();
+                }
+                
+                // Convert ArrayBuffer to Int16Array (PCM 16-bit)
+                const pcmData = new Int16Array(audioData);
+                
+                if (pcmData.length === 0) {
+                    return false;
+                }
+                
+                // Add to playback queue for smooth buffered playback
+                audioPlaybackQueue.push(pcmData);
+                
+                // Start playback processor if not already running
+                if (!isPlayingAudio) {
+                    processAudioPlaybackQueue();
+                }
+                
+                return true;
+                
+            } catch (error) {
+                addMessage('⚠️ PCM playback failed: ' + error.message);
+                return false;
+            }
+        }
+
+        async function processAudioPlaybackQueue() {
+            if (isPlayingAudio) return;
+            isPlayingAudio = true;
+            
+            // Initialize playback timing
+            if (nextPlayTime === 0) {
+                nextPlayTime = audioContext.currentTime;
+            }
+            
+            while (audioPlaybackQueue.length > 0) {
+                const pcmData = audioPlaybackQueue.shift();
+                
+                try {
+                    // Create audio buffer for playback
+                    const sampleRate = audioContext.sampleRate;
+                    const audioBuffer = audioContext.createBuffer(1, pcmData.length, sampleRate);
+                    const channelData = audioBuffer.getChannelData(0);
+                    
+                    // Convert Int16 PCM to Float32 for Web Audio API
+                    for (let i = 0; i < pcmData.length; i++) {
+                        channelData[i] = pcmData[i] / 32767.0; // Normalize to [-1, 1]
+                    }
+                    
+                    // Create and schedule audio source for seamless playback
+                    const source = audioContext.createBufferSource();
+                    source.buffer = audioBuffer;
+                    source.connect(audioContext.destination);
+                    
+                    // Schedule playback at the exact right time for smooth audio
+                    source.start(nextPlayTime);
+                    
+                    // Calculate next play time for seamless continuation
+                    const chunkDuration = audioBuffer.duration;
+                    nextPlayTime += chunkDuration;
+                    
+                    // If we've fallen behind real-time, catch up
+                    if (nextPlayTime < audioContext.currentTime) {
+                        nextPlayTime = audioContext.currentTime;
+                    }
+                    
+                } catch (error) {
+                    addMessage('⚠️ Audio playback scheduling failed: ' + error.message);
+                }
+                
+                // Small delay to prevent overwhelming the audio system
+                await new Promise(resolve => setTimeout(resolve, 10));
+            }
+            
+            isPlayingAudio = false;
+        }
+
+        async function tryPlayOpusAudio(bytes) {
+            try {
+                // Simple WebM container parsing to find Opus frames
+                const dataView = new DataView(bytes.buffer || bytes);
+                
+                // Look for Opus audio blocks in WebM (simplified parser)
+                let opusData = null;
+                let offset = 0;
+                
+                // Scan for Opus frames (this is a simplified approach)
+                while (offset < bytes.length - 4) {
+                    // Look for WebM SimpleBlock or Block elements that contain Opus data
+                    if (bytes[offset] === 0xa3) { // SimpleBlock
+                        // Skip past WebM container headers and extract audio payload
+                        let blockSize = 0;
+                        let headerOffset = offset + 1;
+                        
+                        // Parse EBML variable-length integer for block size
+                        let firstByte = bytes[headerOffset];
+                        if ((firstByte & 0x80) !== 0) {
+                            blockSize = firstByte & 0x7f;
+                            headerOffset += 1;
+                        } else if ((firstByte & 0x40) !== 0) {
+                            blockSize = ((firstByte & 0x3f) << 8) | bytes[headerOffset + 1];
+                            headerOffset += 2;
+                        }
+                        
+                        if (blockSize > 0 && blockSize < bytes.length - headerOffset) {
+                            // Extract potential Opus payload
+                            const payload = bytes.slice(headerOffset + 3, headerOffset + blockSize);
+                            if (payload.length > 10) {
+                                opusData = payload;
+                                break;
+                            }
+                        }
+                    }
+                    offset++;
+                }
+                
+                if (opusData) {
+                    // Try to decode and play Opus data using Web Audio API
+                    if (!audioContext) {
+                        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                    }
+                    
+                    // Create a simple Opus frame wrapper that browsers can decode
+                    const opusBlob = new Blob([opusData], { type: 'audio/opus' });
+                    const arrayBuffer = await opusBlob.arrayBuffer();
+                    
+                    try {
+                        const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+                        const source = audioContext.createBufferSource();
+                        source.buffer = audioBuffer;
+                        source.connect(audioContext.destination);
+                        source.start(0);
+                        
+                        addMessage('🎵 Decoded and playing Opus audio!');
+                        return true;
+                    } catch (decodeError) {
+                        addMessage('⚠️ Opus decode failed, trying alternative: ' + decodeError.message);
+                        return false;
+                    }
+                }
+                
+                return false;
+                
+            } catch (error) {
+                addMessage('⚠️ Opus extraction failed: ' + error.message);
+                return false;
+            }
+        }
+
+        async function tryPlayWebMBlob(bytes) {
+            try {
+                // Create a complete WebM blob and try to play it
+                const blob = new Blob([bytes], { type: 'audio/webm;codecs=opus' });
+                const url = URL.createObjectURL(blob);
+                
+                const audio = new Audio();
+                audio.src = url;
+                
+                return new Promise((resolve, reject) => {
+                    audio.oncanplay = () => {
+                        addMessage('🎵 Playing WebM audio');
+                        audio.play().then(() => {
+                            resolve(true);
+                        }).catch(reject);
+                    };
+                    
+                    audio.onerror = () => {
+                        URL.revokeObjectURL(url);
+                        addMessage('⚠️ WebM playback failed, using confirmation beep');
+                        playAudioConfirmationBeep();
+                        resolve(false);
+                    };
+                    
+                    audio.onended = () => {
+                        URL.revokeObjectURL(url);
+                    };
+                    
+                    // Timeout after 1 second
+                    setTimeout(() => {
+                        if (audio.readyState === 0) {
+                            URL.revokeObjectURL(url);
+                            addMessage('⚠️ Audio load timeout, using confirmation beep');
+                            playAudioConfirmationBeep();
+                            resolve(false);
+                        }
+                    }, 1000);
+                });
+                
+            } catch (error) {
+                addMessage('⚠️ WebM blob creation failed: ' + error.message);
+                playAudioConfirmationBeep();
+                return false;
+            }
+        }
+        
+        // Confirmation beep to indicate audio is being relayed
+        function playAudioConfirmationBeep() {
+            try {
+                // Initialize audio context if needed
+                if (!audioContext) {
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                }
+                
+                // Resume audio context if suspended
+                if (audioContext.state === 'suspended') {
+                    audioContext.resume();
+                }
+                
+                // Create a very brief, subtle beep
+                const oscillator = audioContext.createOscillator();
+                const gainNode = audioContext.createGain();
+                
+                oscillator.connect(gainNode);
+                gainNode.connect(audioContext.destination);
+                
+                // Higher frequency for less intrusive sound
+                oscillator.frequency.setValueAtTime(1200, audioContext.currentTime);
+                oscillator.type = 'sine';
+                
+                // Very quiet and brief
+                gainNode.gain.setValueAtTime(0, audioContext.currentTime);
+                gainNode.gain.linearRampToValueAtTime(0.1, audioContext.currentTime + 0.005);
+                gainNode.gain.exponentialRampToValueAtTime(0.001, audioContext.currentTime + 0.05);
+                
+                // Very short duration
+                oscillator.start(audioContext.currentTime);
+                oscillator.stop(audioContext.currentTime + 0.05);
+                
+            } catch (error) {
+                // Silent fail for beep generation
+            }
+        }
+        
+        // Keep the notification sound as fallback
+        function playNotificationSound() {
+            try {
+                if (!audioContext) {
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                }
+                
+                if (audioContext.state === 'suspended') {
+                    audioContext.resume();
+                }
+                
+                const oscillator = audioContext.createOscillator();
+                const gainNode = audioContext.createGain();
+                
+                oscillator.connect(gainNode);
+                gainNode.connect(audioContext.destination);
+                
+                oscillator.frequency.setValueAtTime(600, audioContext.currentTime);
+                oscillator.type = 'sine';
+                
+                gainNode.gain.setValueAtTime(0, audioContext.currentTime);
+                gainNode.gain.linearRampToValueAtTime(0.2, audioContext.currentTime + 0.01);
+                gainNode.gain.exponentialRampToValueAtTime(0.001, audioContext.currentTime + 0.1);
+                
+                oscillator.start(audioContext.currentTime);
+                oscillator.stop(audioContext.currentTime + 0.1);
+                
+                addMessage('🔔 Audio received (notification tone)');
+                
+            } catch (error) {
+                addMessage('❌ Could not play notification: ' + error.message);
+            }
+        }
 
         function connect() {
             if (ws) return;
@@ -281,11 +906,48 @@
             };
             
             ws.onmessage = function(event) {
-                try {
-                    const data = JSON.parse(event.data);
-                    handleServerEvent(data);
-                } catch (e) {
-                    addMessage('Received: ' + event.data);
+                if (event.data instanceof ArrayBuffer) {
+                    // Handle binary audio data with user ID from previous metadata
+                    const userID = currentAudioMetadata ? currentAudioMetadata.user_id : 'unknown';
+                    
+                    // Only log occasionally for performance
+                    if (Math.random() < 0.02) {
+                        addMessage('📡 Received ArrayBuffer audio from ' + userID + ': ' + event.data.byteLength + ' bytes');
+                    }
+                    
+                    playReceivedAudio(event.data, userID);
+                    currentAudioMetadata = null; // Clear after use
+                    
+                } else if (event.data instanceof Blob) {
+                    // Handle binary audio data as Blob with user ID
+                    const userID = currentAudioMetadata ? currentAudioMetadata.user_id : 'unknown';
+                    
+                    if (Math.random() < 0.02) {
+                        addMessage('📡 Received Blob audio from ' + userID + ': ' + event.data.size + ' bytes');
+                    }
+                    
+                    event.data.arrayBuffer().then(buffer => {
+                        playReceivedAudio(buffer, userID);
+                    });
+                    currentAudioMetadata = null; // Clear after use
+                    
+                } else if (typeof event.data === 'string') {
+                    try {
+                        const data = JSON.parse(event.data);
+                        
+                        // Check if this is audio metadata
+                        if (data.type === 'audio_data') {
+                            currentAudioMetadata = data;
+                            // Don't handle as regular event, just store for next binary message
+                            return;
+                        }
+                        
+                        handleServerEvent(data);
+                    } catch (e) {
+                        addMessage('Received text: ' + event.data);
+                    }
+                } else {
+                    addMessage('Received unknown data type: ' + typeof event.data);
                 }
             };
             
@@ -338,6 +1000,7 @@
                     if (event.user_id === (currentUser ? currentUser.id : '')) {
                         currentChannel = event.channel_id;
                         document.getElementById('channel-input').value = currentChannel;
+                        updatePTTButtonState();
                     }
                     updateStats();
                     updateChannelsList();
@@ -348,6 +1011,7 @@
                     if (event.user_id === (currentUser ? currentUser.id : '')) {
                         currentChannel = '';
                         document.getElementById('channel-input').value = '';
+                        updatePTTButtonState();
                     }
                     updateStats();
                     updateChannelsList();
@@ -403,7 +1067,14 @@
             
             isPTTActive = true;
             pttButton.classList.add('active');
-            pttButton.textContent = 'TRANSMITTING...';
+            
+            if (microphonePermission) {
+                pttButton.textContent = 'TRANSMITTING AUDIO...';
+                startAudioCapture();
+            } else {
+                pttButton.textContent = 'TRANSMITTING EVENT...';
+            }
+            
             sendEvent('ptt_start');
         }
 
@@ -412,7 +1083,12 @@
             
             isPTTActive = false;
             pttButton.classList.remove('active');
-            pttButton.textContent = 'HOLD TO TALK';
+            
+            if (microphonePermission) {
+                stopAudioCapture();
+            }
+            
+            updatePTTButtonState();
             sendEvent('ptt_end');
         }
 
@@ -511,6 +1187,7 @@
         // Auto-connect and periodic updates
         window.onload = function() {
             connect();
+            initializeAudio();
             setInterval(updateStats, 2000);
             setInterval(updateChannelsList, 3000);
             setInterval(updateUsersList, 3000);

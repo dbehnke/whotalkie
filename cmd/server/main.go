@@ -84,24 +84,97 @@ func handleWebSocket(c *gin.Context) {
 
 func handleClientRead(wsConn *types.WebSocketConnection) {
 	ctx := context.Background()
+	var expectingAudioData bool
+	var audioMetadata *types.PTTEvent
 	
 	for {
-		_, message, err := wsConn.Conn.Read(ctx)
+		msgType, message, err := wsConn.Conn.Read(ctx)
 		if err != nil {
 			log.Printf("WebSocket read error for user %s: %v", wsConn.UserID, err)
 			break
 		}
 		
-		var event types.PTTEvent
-		if err := json.Unmarshal(message, &event); err != nil {
-			log.Printf("Failed to parse message from user %s: %v", wsConn.UserID, err)
+		switch msgType {
+		case websocket.MessageText:
+			// Handle JSON events
+			var event types.PTTEvent
+			if err := json.Unmarshal(message, &event); err != nil {
+				log.Printf("Failed to parse message from user %s: %v", wsConn.UserID, err)
+				continue
+			}
+			
+			event.UserID = wsConn.UserID
+			event.Timestamp = time.Now()
+			
+			// Check if this is audio metadata
+			if event.Type == string(types.EventAudioData) {
+				expectingAudioData = true
+				audioMetadata = &event
+				log.Printf("Expecting audio data from user %s, size: %v bytes", wsConn.UserID, event.Data["chunk_size"])
+			} else {
+				handleEvent(&event)
+			}
+			
+		case websocket.MessageBinary:
+			// Handle binary audio data
+			if expectingAudioData && audioMetadata != nil {
+				handleAudioData(wsConn, audioMetadata, message)
+				expectingAudioData = false
+				audioMetadata = nil
+			} else {
+				log.Printf("Received unexpected binary data from user %s", wsConn.UserID)
+			}
+		}
+	}
+}
+
+func handleAudioData(wsConn *types.WebSocketConnection, metadata *types.PTTEvent, audioData []byte) {
+	user, exists := stateManager.GetUser(wsConn.UserID)
+	if !exists || user.Channel == "" {
+		log.Printf("Audio data from user %s but no active channel", wsConn.UserID)
+		return
+	}
+
+	log.Printf("Relaying %d bytes of audio from user %s in channel %s", 
+		len(audioData), user.Username, user.Channel)
+
+	// Get all clients in the same channel
+	channel, exists := stateManager.GetChannel(user.Channel)
+	if !exists {
+		log.Printf("Channel %s not found for audio relay", user.Channel)
+		return
+	}
+
+	// Broadcast audio to all other users in the channel
+	for _, channelUser := range channel.Users {
+		if channelUser.ID == wsConn.UserID {
+			continue // Don't send audio back to sender
+		}
+
+		client, exists := stateManager.GetClient(channelUser.ID)
+		if !exists {
 			continue
 		}
-		
-		event.UserID = wsConn.UserID
-		event.Timestamp = time.Now()
-		
-		handleEvent(&event)
+
+		// Send audio metadata first, then binary data
+		metadataBytes, err := json.Marshal(metadata)
+		if err != nil {
+			log.Printf("Failed to marshal audio metadata: %v", err)
+			continue
+		}
+
+		select {
+		case client.Send <- metadataBytes:
+			// Then send the binary audio data
+			select {
+			case client.Send <- audioData:
+				// Success
+			default:
+				log.Printf("Audio data send buffer full for user %s", channelUser.ID)
+			}
+		default:
+			log.Printf("Metadata send buffer full for user %s", channelUser.ID)
+		}
 	}
 }
 
@@ -115,7 +188,18 @@ func handleClientWrite(wsConn *types.WebSocketConnection) {
 				return
 			}
 			
-			if err := wsConn.Conn.Write(ctx, websocket.MessageText, message); err != nil {
+			// Determine message type by trying to parse as JSON
+			var messageType websocket.MessageType
+			var event types.PTTEvent
+			if err := json.Unmarshal(message, &event); err == nil {
+				// It's JSON, send as text
+				messageType = websocket.MessageText
+			} else {
+				// It's binary data, send as binary
+				messageType = websocket.MessageBinary
+			}
+			
+			if err := wsConn.Conn.Write(ctx, messageType, message); err != nil {
 				log.Printf("WebSocket write error for user %s: %v", wsConn.UserID, err)
 				return
 			}
