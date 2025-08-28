@@ -253,24 +253,27 @@ func handleChannelJoin(event *types.PTTEvent) {
 	}
 	
 	channel := stateManager.GetOrCreateChannel(channelID, channelID)
-	if err := stateManager.JoinChannel(event.UserID, channelID); err != nil {
-		log.Printf("Failed to join channel %s: %v", channelID, err)
-		return
-	}
 	
 	user, _ := stateManager.GetUser(event.UserID)
 	
 	// Handle publish-only mode
 	if publishOnly, ok := event.Data["publish_only"].(bool); ok && publishOnly {
 		user.PublishOnly = true
-		stateManager.UpdateUser(user)
 		log.Printf("User %s (%s) set to publish-only mode", user.Username, user.ID)
 	}
 	
 	// Update username if provided
 	if username, ok := event.Data["username"].(string); ok && username != "" {
 		user.Username = username
-		stateManager.UpdateUser(user)
+	}
+	
+	// Update user in state
+	stateManager.UpdateUser(user)
+	
+	// Now join channel with updated user data
+	if err := stateManager.JoinChannel(event.UserID, channelID); err != nil {
+		log.Printf("Failed to join channel %s: %v", channelID, err)
+		return
 	}
 	
 	event.Data = map[string]interface{}{
@@ -301,12 +304,39 @@ func handlePTTStart(event *types.PTTEvent) {
 	if !exists || user.Channel == "" {
 		return
 	}
-	
+
+	// Get the channel
+	channel, exists := stateManager.GetChannel(user.Channel)
+	if !exists {
+		return
+	}
+
+	// If this user is NOT publish-only, check if any publish-only users are in the channel
+	if !user.PublishOnly {
+		for _, u := range channel.Users {
+			if u.PublishOnly {
+				log.Printf("PTT blocked for user %s in channel %s because publish-only user %s is present", user.Username, channel.ID, u.Username)
+				return
+			}
+		}
+	}
+
+	// Add user to active speakers
+	if channel.ActiveSpeakers == nil {
+		channel.ActiveSpeakers = make(map[string]types.SpeakerState)
+	}
+	channel.ActiveSpeakers[user.ID] = types.SpeakerState{
+		UserID:    user.ID,
+		Username:  user.Username,
+		StartTime: time.Now(),
+		IsTalking: true,
+	}
+
 	event.ChannelID = user.Channel
 	event.Data = map[string]interface{}{
 		"username": user.Username,
 	}
-	
+
 	stateManager.BroadcastEvent(event)
 }
 
@@ -314,6 +344,12 @@ func handlePTTEnd(event *types.PTTEvent) {
 	user, exists := stateManager.GetUser(event.UserID)
 	if !exists || user.Channel == "" {
 		return
+	}
+	
+	// Remove user from active speakers
+	channel, exists := stateManager.GetChannel(user.Channel)
+	if exists {
+		delete(channel.ActiveSpeakers, user.ID)
 	}
 	
 	event.ChannelID = user.Channel
@@ -376,6 +412,7 @@ func main() {
 	
 	r := gin.Default()
 
+	r.Static("/static", "./web/static")
 	r.LoadHTMLGlob("web/templates/*")
 
 	r.GET("/health", func(c *gin.Context) {

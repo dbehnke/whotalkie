@@ -14,14 +14,22 @@ type User struct {
 	PublishOnly bool   `json:"publish_only,omitempty"`
 }
 
+type SpeakerState struct {
+	UserID    string    `json:"user_id"`
+	Username  string    `json:"username"`
+	StartTime time.Time `json:"start_time"`
+	IsTalking bool      `json:"is_talking"`
+}
+
 type Channel struct {
-	ID          string    `json:"id"`
-	Name        string    `json:"name"`
-	Users       []User    `json:"users"`
-	CreatedAt   time.Time `json:"created_at"`
-	MaxUsers    int       `json:"max_users"`
-	IsActive    bool      `json:"is_active"`
-	Description string    `json:"description,omitempty"`
+	ID             string                  `json:"id"`
+	Name           string                  `json:"name"`
+	Users          []User                  `json:"users"`
+	ActiveSpeakers map[string]SpeakerState `json:"active_speakers"`
+	CreatedAt      time.Time               `json:"created_at"`
+	MaxUsers       int                     `json:"max_users"`
+	IsActive       bool                    `json:"is_active"`
+	Description    string                  `json:"description,omitempty"`
 }
 
 type PTTEvent struct {

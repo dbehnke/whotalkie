@@ -1,6 +1,7 @@
 package state
 
 import (
+	"sort"
 	"sync"
 	"time"
 
@@ -63,6 +64,12 @@ func (m *Manager) GetAllUsers() []*types.User {
 	for _, user := range m.users {
 		users = append(users, user)
 	}
+	
+	// Sort users by username for consistent ordering
+	sort.Slice(users, func(i, j int) bool {
+		return users[i].Username < users[j].Username
+	})
+	
 	return users
 }
 
@@ -101,13 +108,14 @@ func (m *Manager) CreateChannel(channelID, name string) *types.Channel {
 	defer m.mu.Unlock()
 	
 	channel := &types.Channel{
-		ID:          channelID,
-		Name:        name,
-		Users:       []types.User{},
-		CreatedAt:   time.Now(),
-		MaxUsers:    50,
-		IsActive:    true,
-		Description: "",
+		ID:             channelID,
+		Name:           name,
+		Users:          []types.User{},
+		ActiveSpeakers: make(map[string]types.SpeakerState),
+		CreatedAt:      time.Now(),
+		MaxUsers:       50,
+		IsActive:       true,
+		Description:    "",
 	}
 	
 	m.channels[channelID] = channel
@@ -136,6 +144,12 @@ func (m *Manager) GetAllChannels() []*types.Channel {
 	for _, channel := range m.channels {
 		channels = append(channels, channel)
 	}
+	
+	// Sort channels by name for consistent ordering
+	sort.Slice(channels, func(i, j int) bool {
+		return channels[i].Name < channels[j].Name
+	})
+	
 	return channels
 }
 

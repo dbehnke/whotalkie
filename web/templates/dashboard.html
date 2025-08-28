@@ -73,23 +73,77 @@
             border-bottom: 1px solid #eee;
             padding-bottom: 5px;
         }
-        .channel-list, .user-list {
+        .channel-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        .channel-card {
+            background: #f8f9fa;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            padding: 15px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.2s;
+            position: relative;
+            min-height: 80px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+        }
+        .channel-card:hover {
+            background: #e3f2fd;
+            border-color: #2196F3;
+        }
+        .channel-card.active {
+            background: #2196F3;
+            color: white;
+            border-color: #1976D2;
+        }
+        /* When we're in the channel and it's talking - green background with white fonts */
+        .channel-card.active.talking {
+            background: #4CAF50;
+            color: white;
+            border: 1px solid #45a049;
+        }
+        
+        /* When we're not in the channel but it's talking - keep normal background, just indicate with visual cue */
+        .channel-card.talking:not(.active) {
+            background: #f8f9fa; /* Keep normal background */
+            color: #333; /* Normal text color */
+            border: 2px solid #4CAF50; /* Green border to show activity */
+        }
+        .channel-card.publish-only {
+            background: #f2f2f2;
+            cursor: not-allowed;
+        }
+
+        .publish-only-indicator {
+            font-size: 10px;
+            color: #999;
+            margin-top: 5px;
+        }
+        
+        /* Make "Read-Only" text visible on green background */
+        .channel-card.active.talking .publish-only-indicator {
+            color: rgba(255,255,255,0.8);
+            font-weight: bold;
+        }
+        .user-list {
             max-height: 200px;
             overflow-y: auto;
         }
-        .channel-item, .user-item {
+        .user-item {
             padding: 8px 12px;
             margin: 5px 0;
             border-radius: 4px;
             cursor: pointer;
             transition: background 0.2s;
         }
-        .channel-item:hover {
+        .user-item:hover {
             background: #e3f2fd;
-        }
-        .channel-item.active {
-            background: #2196F3;
-            color: white;
         }
         .user-item.active {
             background: #4CAF50;
@@ -101,9 +155,44 @@
             animation: pulse 1s infinite;
         }
         @keyframes pulse {
-            0% { opacity: 1; }
-            50% { opacity: 0.7; }
-            100% { opacity: 1; }
+            0% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.8; transform: scale(1.02); }
+            100% { opacity: 1; transform: scale(1); }
+        }
+        .channel-status {
+            position: absolute;
+            top: 5px;
+            right: 5px;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #ccc;
+        }
+        .channel-status.active {
+            background: #2196F3;
+        }
+        .channel-status.talking {
+            background: #4CAF50;
+            animation: pulse 1s infinite;
+        }
+        .audio-info {
+            font-size: 10px;
+            margin-top: 5px;
+            padding: 2px 4px;
+            border-radius: 3px;
+        }
+        
+        /* Audio info styling for when we're in the talking channel - white text on dark badge */
+        .channel-card.active.talking .audio-info {
+            color: rgba(255,255,255,0.9);
+            background: rgba(0,0,0,0.2);
+        }
+        
+        /* Audio info styling for when we're not in the talking channel - normal styling */
+        .channel-card.talking:not(.active) .audio-info {
+            color: #4CAF50;
+            background: rgba(76, 175, 80, 0.1);
+            font-weight: bold;
         }
         .ptt-button {
             width: 100%;
@@ -220,19 +309,40 @@
                 <span id="user-info"></span>
             </div>
             
-            <div id="audio-stats" style="display: none; background: #f0f0f0; padding: 10px; border-radius: 4px; margin: 10px 0; font-family: monospace; font-size: 12px;">
-                <div style="display: flex; justify-content: space-between; gap: 20px;">
+            <!-- Always-visible Audio Stats Panel -->
+            <div id="audio-stats" style="background: #f8f9fa; border: 1px solid #ddd; border-radius: 8px; margin: 10px 0; font-family: monospace; font-size: 11px;">
+                <!-- Compact header with key info -->
+                <div style="background: #e9ecef; padding: 8px; border-radius: 8px 8px 0 0; display: flex; justify-content: space-between; align-items: center;">
+                    <div style="font-weight: bold; color: #495057;">📡 Audio Status</div>
+                    <div style="font-size: 10px; color: #6c757d;">
+                        <span id="connection-indicator" style="display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #28a745; margin-right: 4px;"></span>
+                        Opus WebCodecs
+                    </div>
+                </div>
+                
+                <!-- Compact TX/RX Stats in two columns -->
+                <div style="padding: 8px; display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
                     <div id="transmission-stats">
-                        <strong>📤 Transmitting:</strong><br>
-                        Duration: <span id="tx-duration">0.0s</span><br>
-                        Bytes: <span id="tx-bytes">0</span><br>
-                        Bitrate: <span id="tx-bitrate">0 kbps</span>
+                        <div style="font-weight: bold; color: #dc3545; font-size: 10px; margin-bottom: 4px;">📤 TX</div>
+                        <div>⏱️ <span id="tx-duration">0.0s</span></div>
+                        <div>📊 <span id="tx-bitrate">0 kbps</span></div>
+                        <div>💾 <span id="tx-bytes">0 B</span></div>
                     </div>
                     <div id="reception-stats">
-                        <strong>📥 Receiving:</strong><br>
-                        Duration: <span id="rx-duration">0.0s</span><br>
-                        Bytes: <span id="rx-bytes">0</span><br>
-                        Bitrate: <span id="rx-bitrate">0 kbps</span>
+                        <div style="font-weight: bold; color: #28a745; font-size: 10px; margin-bottom: 4px;">📥 RX</div>
+                        <div>⏱️ <span id="rx-duration">0.0s</span></div>
+                        <div>📊 <span id="rx-bitrate">0 kbps</span></div>
+                        <div>💾 <span id="rx-bytes">0 B</span></div>
+                        <div>🔊 <span id="rx-channels">-</span></div>
+                        <div>👤 <span id="rx-source" style="font-weight: bold; color: #007bff;">-</span></div>
+                    </div>
+                </div>
+                
+                <!-- Active Speakers - compact list -->
+                <div style="padding: 6px 8px; background: #f1f3f4; border-top: 1px solid #dee2e6; border-radius: 0 0 8px 8px;">
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        <span style="font-weight: bold; color: #495057; font-size: 10px;">🎙️ ACTIVE:</span>
+                        <div id="speakers-list" style="flex: 1; font-size: 10px; color: #6c757d;">None</div>
                     </div>
                 </div>
             </div>
@@ -261,7 +371,7 @@
         <div class="channels-section">
             <div class="channels-panel">
                 <div class="panel-title">Active Channels</div>
-                <div id="channels-list" class="channel-list">
+                <div id="channel-grid" class="channel-grid">
                     <div style="color: #999; text-align: center; padding: 20px;">No active channels</div>
                 </div>
             </div>
@@ -279,1032 +389,6 @@
         </div>
     </div>
 
-    <script>
-        let ws = null;
-        let currentUser = null;
-        let currentChannel = '';
-        let isPTTActive = false;
-        
-        // Audio system variables
-        let audioContext = null;
-        let mediaStream = null;
-        let nextPlayTime = 0;
-        let activeAudioSources = new Map(); // Track audio sources by user ID
-        let decoderTimestamp = 0;
-        let audioBuffer = []; // Buffer for smooth playback
-        let isBuffering = false;
-        let audioMixerGain = null;
-        let microphonePermission = false;
-        
-        // WebCodecs Opus system variables
-        let webCodecsEncoder = null;
-        let webCodecsDecoder = null;
-        const OPUS_SAMPLE_RATE = 48000;
-        const OPUS_BITRATE = 32000;
-        let webCodecsSupported = false;
-        let audioTimestamp = 0; // Track continuous timestamp
-
-        // Audio statistics tracking
-        let audioStats = {
-            transmitting: false,
-            receiving: false,
-            transmissionStartTime: 0,
-            receptionStartTime: 0,
-            transmittedBytes: 0,
-            receivedBytes: 0,
-            transmissionDuration: 0,
-            receptionDuration: 0,
-            currentTransmitBitrate: 0,
-            currentReceiveBitrate: 0
-        };
-        let statsUpdateInterval = null;
-
-        // DOM Elements
-        const messagesDiv = document.getElementById('messages');
-        const connectionStatus = document.getElementById('connection-status');
-        const connectionText = document.getElementById('connection-text');
-        const userInfo = document.getElementById('user-info');
-        const pttButton = document.getElementById('ptt-button');
-
-        // Store metadata for the next binary audio frame
-        let currentAudioMetadata = null;
-
-        // Audio statistics functions
-        function startTransmissionStats() {
-            audioStats.transmitting = true;
-            audioStats.transmissionStartTime = performance.now();
-            audioStats.transmittedBytes = 0;
-            audioStats.currentTransmitBitrate = 0;
-            
-            document.getElementById('audio-stats').style.display = 'block';
-            document.getElementById('transmission-stats').style.opacity = '1';
-            
-            if (!statsUpdateInterval) {
-                statsUpdateInterval = setInterval(updateStatsDisplay, 100); // Update every 100ms
-            }
-        }
-
-        function stopTransmissionStats() {
-            audioStats.transmitting = false;
-            document.getElementById('transmission-stats').style.opacity = '0.5';
-            
-            if (!audioStats.receiving) {
-                setTimeout(() => {
-                    document.getElementById('audio-stats').style.display = 'none';
-                }, 2000); // Hide after 2 seconds if not receiving
-            }
-            
-            if (!audioStats.receiving && statsUpdateInterval) {
-                clearInterval(statsUpdateInterval);
-                statsUpdateInterval = null;
-            }
-        }
-
-        function startReceptionStats() {
-            audioStats.receiving = true;
-            audioStats.receptionStartTime = performance.now();
-            audioStats.receivedBytes = 0;
-            audioStats.currentReceiveBitrate = 0;
-            
-            document.getElementById('audio-stats').style.display = 'block';
-            document.getElementById('reception-stats').style.opacity = '1';
-            
-            if (!statsUpdateInterval) {
-                statsUpdateInterval = setInterval(updateStatsDisplay, 100);
-            }
-        }
-
-        function stopReceptionStats() {
-            audioStats.receiving = false;
-            document.getElementById('reception-stats').style.opacity = '0.5';
-            
-            if (!audioStats.transmitting) {
-                setTimeout(() => {
-                    document.getElementById('audio-stats').style.display = 'none';
-                }, 2000);
-            }
-            
-            if (!audioStats.transmitting && statsUpdateInterval) {
-                clearInterval(statsUpdateInterval);
-                statsUpdateInterval = null;
-            }
-        }
-
-        function updateStatsDisplay() {
-            const now = performance.now();
-            
-            if (audioStats.transmitting) {
-                audioStats.transmissionDuration = (now - audioStats.transmissionStartTime) / 1000;
-                audioStats.currentTransmitBitrate = audioStats.transmissionDuration > 0 ? 
-                    (audioStats.transmittedBytes * 8 / audioStats.transmissionDuration / 1000) : 0;
-                
-                document.getElementById('tx-duration').textContent = audioStats.transmissionDuration.toFixed(1) + 's';
-                document.getElementById('tx-bytes').textContent = formatBytes(audioStats.transmittedBytes);
-                document.getElementById('tx-bitrate').textContent = audioStats.currentTransmitBitrate.toFixed(1) + ' kbps';
-            }
-            
-            if (audioStats.receiving) {
-                audioStats.receptionDuration = (now - audioStats.receptionStartTime) / 1000;
-                audioStats.currentReceiveBitrate = audioStats.receptionDuration > 0 ? 
-                    (audioStats.receivedBytes * 8 / audioStats.receptionDuration / 1000) : 0;
-                
-                document.getElementById('rx-duration').textContent = audioStats.receptionDuration.toFixed(1) + 's';
-                document.getElementById('rx-bytes').textContent = formatBytes(audioStats.receivedBytes);
-                document.getElementById('rx-bitrate').textContent = audioStats.currentReceiveBitrate.toFixed(1) + ' kbps';
-            }
-        }
-
-        function formatBytes(bytes) {
-            if (bytes < 1024) return bytes + ' B';
-            if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
-            return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
-        }
-
-        function updateOpusStatus() {
-            const statusDiv = document.getElementById('opus-status');
-            
-            if (webCodecsSupported) {
-                statusDiv.textContent = '✅ WebCodecs Opus encoding/decoding ready';
-                statusDiv.style.color = '#4CAF50';
-            } else {
-                statusDiv.textContent = '❌ WebCodecs API not supported in this browser';
-                statusDiv.style.color = '#f44336';
-            }
-        }
-
-        // --- Core Functions ---
-
-        async function initializeAudio() {
-            try {
-                addMessage('Requesting microphone access...');
-                mediaStream = await navigator.mediaDevices.getUserMedia({
-                    audio: {
-                        echoCancellation: true,
-                        noiseSuppression: true,
-                        autoGainControl: true, // Let browser handle this for simplicity
-                        sampleRate: 48000,     // Request 48kHz if possible
-                        channelCount: 1
-                    }
-                });
-                microphonePermission = true;
-                addMessage('✅ Microphone access granted');
-                await initializeWebCodecs(); // Initialize WebCodecs after getting mic stream
-                updatePTTButtonState();
-            } catch (error) {
-                addMessage('❌ Microphone access denied: ' + error.message);
-                microphonePermission = false;
-                updatePTTButtonState();
-            }
-        }
-
-        async function initializeWebCodecs() {
-            // Check WebCodecs API support
-            if (!window.AudioEncoder || !window.AudioDecoder) {
-                addMessage('❌ WebCodecs API not supported. Opus audio unavailable.');
-                webCodecsSupported = false;
-                updateOpusStatus();
-                return;
-            }
-
-            try {
-                // Check Opus codec support
-                const encoderSupport = await AudioEncoder.isConfigSupported({
-                    codec: 'opus',
-                    sampleRate: OPUS_SAMPLE_RATE,
-                    numberOfChannels: 1,
-                    bitrate: OPUS_BITRATE
-                });
-                
-                const decoderSupport = await AudioDecoder.isConfigSupported({
-                    codec: 'opus',
-                    sampleRate: OPUS_SAMPLE_RATE,
-                    numberOfChannels: 1
-                });
-
-                if (!encoderSupport.supported || !decoderSupport.supported) {
-                    addMessage('❌ Opus codec not supported by WebCodecs.');
-                    webCodecsSupported = false;
-                    updateOpusStatus();
-                    return;
-                }
-
-                addMessage('Initializing WebCodecs Opus encoder/decoder...');
-                
-                // Initialize encoder
-                webCodecsEncoder = new AudioEncoder({
-                    output: (encodedChunk) => {
-                        if (ws && ws.readyState === WebSocket.OPEN) {
-                            // Send immediately for low latency
-                            sendOpusAudioChunk(encodedChunk);
-                        }
-                    },
-                    error: (err) => {
-                        addMessage('❌ Encoder error: ' + err.message);
-                    }
-                });
-                
-                webCodecsEncoder.configure({
-                    codec: 'opus',
-                    sampleRate: OPUS_SAMPLE_RATE,
-                    numberOfChannels: 1,
-                    bitrate: OPUS_BITRATE
-                });
-                
-                // Initialize decoder
-                webCodecsDecoder = new AudioDecoder({
-                    output: (audioData) => {
-                        playDecodedAudio(audioData);
-                    },
-                    error: (err) => {
-                        addMessage('❌ Decoder error: ' + err.message);
-                    }
-                });
-                
-                webCodecsDecoder.configure({
-                    codec: 'opus',
-                    sampleRate: OPUS_SAMPLE_RATE,
-                    numberOfChannels: 1
-                });
-                
-                webCodecsSupported = true;
-                addMessage('✅ WebCodecs Opus encoder/decoder initialized successfully.');
-                updateOpusStatus(); // Update status display
-                
-            } catch (err) {
-                addMessage('❌ Failed to initialize WebCodecs: ' + err.message);
-                webCodecsSupported = false;
-                updateOpusStatus(); // Update status display
-            }
-        }
-
-        function resample(inputData, inputSampleRate, outputSampleRate) {
-            if (inputSampleRate === outputSampleRate) {
-                return inputData;
-            }
-            const ratio = inputSampleRate / outputSampleRate;
-            const outputLength = Math.floor(inputData.length / ratio);
-            const outputData = new Float32Array(outputLength);
-            for (let i = 0; i < outputLength; i++) {
-                const inputIndex = i * ratio;
-                const index1 = Math.floor(inputIndex);
-                const index2 = index1 + 1;
-                const fraction = inputIndex - index1;
-                const sample1 = inputData[index1] || 0;
-                const sample2 = index2 < inputData.length ? inputData[index2] : 0;
-                outputData[i] = sample1 + (sample2 - sample1) * fraction; // Linear interpolation
-            }
-            return outputData;
-        }
-
-        function startAudioCapture() {
-            if (!microphonePermission || !mediaStream) {
-                addMessage('⚠️ No microphone - sending PTT event only.');
-                return;
-            }
-
-            try {
-                if (!audioContext) {
-                    audioContext = new (window.AudioContext || window.webkitAudioContext)();
-                }
-                if (audioContext.state === 'suspended') {
-                    audioContext.resume();
-                }
-                
-                const source = audioContext.createMediaStreamSource(mediaStream);
-                // Use standard buffer size for good latency/performance balance
-                const processor = audioContext.createScriptProcessor(2048, 1, 1);
-                
-                if (!webCodecsSupported || !webCodecsEncoder) {
-                    addMessage('❌ Cannot start audio capture: WebCodecs Opus not available');
-                    return;
-                }
-                
-                addMessage(`🎵 Capturing at ${audioContext.sampleRate}Hz, encoding with WebCodecs Opus.`);
-                
-                processor.onaudioprocess = function(event) {
-                    if (!isPTTActive || !webCodecsEncoder) return;
-
-                    const inputData = event.inputBuffer.getChannelData(0);
-                    
-                    // Resample to 48kHz for Opus if needed
-                    const resampledData = audioContext.sampleRate !== OPUS_SAMPLE_RATE ? 
-                        resample(inputData, audioContext.sampleRate, OPUS_SAMPLE_RATE) : 
-                        inputData;
-                    
-                    // Create AudioData for WebCodecs with proper timestamp
-                    const audioData = new AudioData({
-                        format: 'f32-planar',
-                        sampleRate: OPUS_SAMPLE_RATE,
-                        numberOfFrames: resampledData.length,
-                        numberOfChannels: 1,
-                        timestamp: audioTimestamp,
-                        data: resampledData
-                    });
-                    
-                    // Update timestamp for next frame (microseconds)
-                    audioTimestamp += (resampledData.length * 1000000) / OPUS_SAMPLE_RATE;
-                    
-                    webCodecsEncoder.encode(audioData);
-                    audioData.close(); // Important: release memory
-                };
-                
-                source.connect(processor);
-                // Mute the processor output to prevent feedback
-                const muteGain = audioContext.createGain();
-                muteGain.gain.value = 0;
-                processor.connect(muteGain);
-                muteGain.connect(audioContext.destination);
-                
-                window.audioSource = source;
-                window.audioProcessor = processor;
-                
-                addMessage('🎤 Opus audio capture started.');
-                
-            } catch (error) {
-                addMessage('❌ Audio capture failed: ' + error.message);
-            }
-        }
-
-        function stopAudioCapture() {
-            if (window.audioProcessor) {
-                window.audioProcessor.disconnect();
-                window.audioProcessor.onaudioprocess = null;
-            }
-            if (window.audioSource) {
-                window.audioSource.disconnect();
-            }
-            window.audioProcessor = null;
-            window.audioSource = null;
-            nextPlayTime = 0;
-            
-            addMessage('🎤 Opus audio capture stopped.');
-        }
-
-        function sendOpusAudioChunk(encodedChunk) {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                const byteLength = encodedChunk.byteLength;
-                const audioEvent = {
-                    type: 'audio_data',
-                    timestamp: new Date().toISOString(),
-                    data: {
-                        chunk_size: byteLength,
-                        format: 'opus',
-                        sample_rate: OPUS_SAMPLE_RATE,
-                        channels: 1
-                    }
-                };
-                
-                ws.send(JSON.stringify(audioEvent));
-                
-                // Create array buffer from encoded chunk
-                const buffer = new ArrayBuffer(encodedChunk.byteLength);
-                encodedChunk.copyTo(new Uint8Array(buffer));
-                ws.send(buffer);
-                
-                // Update transmission stats
-                audioStats.transmittedBytes += byteLength;
-                
-                if (Math.random() < 0.05) { // Only log 5% of chunks
-                    addMessage('📤 Sent Opus chunk: ' + byteLength + ' bytes');
-                }
-            } else {
-                addMessage('❌ WebSocket not ready for audio transmission');
-            }
-        }
-        
-        
-        function initializeAudioMixer() {
-            if (!audioContext) {
-                audioContext = new (window.AudioContext || window.webkitAudioContext)();
-            }
-            if (!audioMixerGain) {
-                audioMixerGain = audioContext.createGain();
-                audioMixerGain.gain.value = 0.8; // Set overall volume to prevent clipping
-                audioMixerGain.connect(audioContext.destination);
-                addMessage('🎚️ Audio mixer initialized');
-            }
-        }
-
-        function addToAudioBuffer(pcmData, sampleRate, userID) {
-            // Add audio chunk to buffer
-            audioBuffer.push({
-                data: pcmData,
-                sampleRate: sampleRate,
-                userID: userID,
-                timestamp: performance.now()
-            });
-
-            // Limit buffer size to prevent memory buildup
-            if (audioBuffer.length > BUFFER_MAX_SIZE) {
-                audioBuffer.shift(); // Remove oldest chunk
-                addMessage('⚠️ Audio buffer overflow, dropping old chunks');
-            }
-
-            // Start playback when we have enough buffered
-            if (!isPlayingBuffer && audioBuffer.length >= BUFFER_TARGET_SIZE) {
-                startBufferedPlayback();
-            }
-        }
-
-        async function startBufferedPlayback() {
-            if (isPlayingBuffer) return;
-            isPlayingBuffer = true;
-            addMessage('🎵 Starting buffered audio playback with ~100ms delay');
-
-            while (audioBuffer.length > 0) {
-                const chunk = audioBuffer.shift();
-                
-                try {
-                    await playAudioWithMixingBuffered(chunk.data, chunk.sampleRate, chunk.userID);
-                    
-                    // Wait a bit between chunks for smoother playback
-                    await new Promise(resolve => setTimeout(resolve, 15));
-                    
-                } catch (error) {
-                    addMessage(`⚠️ Buffer playback error: ${error.message}`);
-                }
-                
-                // If buffer gets too low, pause until it fills up again
-                if (audioBuffer.length < 2) {
-                    await new Promise(resolve => setTimeout(resolve, 50));
-                }
-            }
-            
-            isPlayingBuffer = false;
-            addMessage('🔇 Buffered audio playback stopped');
-        }
-
-        async function playDecodedAudio(audioData) {
-            try {
-                const numberOfFrames = audioData.numberOfFrames;
-                const numberOfChannels = audioData.numberOfChannels;
-                const sampleRate = audioData.sampleRate;
-                
-                // Use more efficient buffer allocation
-                const bufferSize = numberOfFrames * numberOfChannels;
-                const pcmBuffer = new ArrayBuffer(bufferSize * 4); // 4 bytes per float32
-                const pcmData = new Float32Array(pcmBuffer);
-                
-                // Copy all audio data efficiently
-                audioData.copyTo(pcmBuffer, { planeIndex: 0, format: 'f32-planar' });
-                
-                // Extract first channel if multi-channel
-                let monoData = pcmData;
-                if (numberOfChannels > 1) {
-                    monoData = new Float32Array(numberOfFrames);
-                    for (let i = 0; i < numberOfFrames; i++) {
-                        monoData[i] = pcmData[i * numberOfChannels]; // Take first channel
-                    }
-                }
-                
-                // Play directly for low latency
-                await playAudioWithMixing(monoData, sampleRate, 'opus-user');
-                
-                // Important: close AudioData to free memory
-                audioData.close();
-                
-            } catch (error) {
-                addMessage(`❌ Error playing decoded audio: ${error.message}`);
-                if (audioData) {
-                    audioData.close(); // Ensure cleanup even on error
-                }
-            }
-        }
-
-        async function playAudioWithMixingBuffered(pcmData, sampleRate, userID) {
-            try {
-                if (!audioContext) {
-                    audioContext = new (window.AudioContext || window.webkitAudioContext)();
-                }
-                if (audioContext.state === 'suspended') {
-                    await audioContext.resume();
-                }
-                if (!audioMixerGain) {
-                    initializeAudioMixer();
-                }
-
-                if (!pcmData || pcmData.length === 0) return;
-
-                // Create audio buffer
-                const audioBuffer = audioContext.createBuffer(1, pcmData.length, sampleRate);
-                audioBuffer.getChannelData(0).set(pcmData);
-
-                const userGain = audioContext.createGain();
-                userGain.gain.value = 0.6; // Conservative volume for buffered playback
-
-                const source = audioContext.createBufferSource();
-                source.buffer = audioBuffer;
-                source.connect(userGain);
-                userGain.connect(audioMixerGain);
-
-                // Play immediately without complex scheduling
-                source.start();
-
-                source.onended = () => {
-                    userGain.disconnect();
-                };
-
-            } catch (error) {
-                addMessage(`⚠️ Buffered audio playback failed for user ${userID}: ${error.message}`);
-            }
-        }
-
-        async function playAudioWithMixing(pcmData, sampleRate, userID) {
-            try {
-                if (!audioContext) {
-                    audioContext = new (window.AudioContext || window.webkitAudioContext)();
-                }
-                if (audioContext.state === 'suspended') {
-                    await audioContext.resume();
-                }
-                if (!audioMixerGain) {
-                    initializeAudioMixer();
-                }
-
-                if (!pcmData || pcmData.length === 0) return;
-
-                // Add to buffer for smooth playback
-                audioBuffer.push({ pcmData, sampleRate, userID });
-                
-                // Start buffered playback if not already running
-                if (!isBuffering) {
-                    processAudioBuffer();
-                }
-
-            } catch (error) {
-                addMessage(`⚠️ Audio playback failed for user ${userID}: ${error.message}`);
-            }
-        }
-        
-        async function processAudioBuffer() {
-            if (isBuffering) return;
-            isBuffering = true;
-            
-            try {
-                while (audioBuffer.length > 0) {
-                    // Wait for buffer to build up slightly for smoother playback
-                    if (audioBuffer.length < 3 && audioBuffer.length > 0) {
-                        await new Promise(resolve => setTimeout(resolve, 10)); // 10ms wait
-                        continue;
-                    }
-                    
-                    if (audioBuffer.length === 0) break;
-                    
-                    const { pcmData, sampleRate, userID } = audioBuffer.shift();
-                    
-                    const audioBufferNode = audioContext.createBuffer(1, pcmData.length, sampleRate);
-                    audioBufferNode.getChannelData(0).set(pcmData);
-
-                    const userGain = audioContext.createGain();
-                    userGain.gain.value = 0.8;
-
-                    const source = audioContext.createBufferSource();
-                    source.buffer = audioBufferNode;
-                    source.connect(userGain);
-                    userGain.connect(audioMixerGain);
-
-                    // Schedule proper playback timing for streaming audio
-                    const currentTime = audioContext.currentTime;
-                    const bufferTime = 0.1; // 100ms buffer for smoother playback
-                    
-                    if (nextPlayTime < currentTime + bufferTime) {
-                        nextPlayTime = currentTime + bufferTime;
-                    }
-                    
-                    source.start(nextPlayTime);
-                    
-                    // Update next play time based on audio duration (20ms for Opus frames)
-                    const frameDuration = pcmData.length / sampleRate;
-                    nextPlayTime += frameDuration;
-
-                    source.onended = () => {
-                        userGain.disconnect();
-                    };
-                    
-                    // Small delay to prevent overwhelming the audio system
-                    await new Promise(resolve => setTimeout(resolve, 5));
-                }
-            } catch (error) {
-                addMessage(`⚠️ Audio buffer processing failed: ${error.message}`);
-            } finally {
-                isBuffering = false;
-                
-                // Continue processing if more audio arrived while we were processing
-                if (audioBuffer.length > 0) {
-                    processAudioBuffer();
-                }
-            }
-        }
-
-        async function playReceivedAudio(audioData, userID = 'unknown', metadata) {
-            try {
-                if (!metadata) {
-                    addMessage('⚠️ Received audio data without metadata. Cannot play.');
-                    return;
-                }
-
-                let pcmData;
-                const format = metadata.data.format;
-                const sampleRate = metadata.data.sample_rate;
-                
-                // Update reception stats
-                audioStats.receivedBytes += audioData.byteLength || audioData.length || 0;
-
-                if (format !== 'opus') {
-                    addMessage(`⚠️ Non-Opus audio format "${format}" from ${userID}. Only Opus is supported.`);
-                    return;
-                }
-                
-                if (!webCodecsSupported) {
-                    addMessage(`⚠️ WebCodecs not supported, skipping audio from ${userID}`);
-                    return;
-                }
-
-                // Ensure decoder is ready and recreate if needed
-                if (!webCodecsDecoder || webCodecsDecoder.state === 'closed' || webCodecsDecoder.state === 'unconfigured') {
-                    try {
-                        webCodecsDecoder = new AudioDecoder({
-                            output: (audioData) => {
-                                playDecodedAudio(audioData);
-                            },
-                            error: (err) => {
-                                addMessage(`❌ Decoder error from ${userID}: ${err.message}`);
-                                // Reset decoder on error for next attempt
-                                webCodecsDecoder = null;
-                            }
-                        });
-                        
-                        // Configure decoder for Opus without description (raw Opus packets)
-                        webCodecsDecoder.configure({
-                            codec: 'opus',
-                            sampleRate: OPUS_SAMPLE_RATE,
-                            numberOfChannels: 1
-                        });
-                        
-                        addMessage(`🔧 Recreated WebCodecs decoder for ${userID}`);
-                        // Reset timestamp and playback timing for new decoder instance
-                        decoderTimestamp = 0;
-                        nextPlayTime = 0;
-                    } catch (err) {
-                        addMessage(`❌ Failed to recreate decoder for ${userID}: ${err.message}`);
-                        return;
-                    }
-                }
-                
-                try {
-                    // Check decoder state before attempting decode
-                    if (webCodecsDecoder.state !== 'configured') {
-                        addMessage(`❌ Decoder not configured (state: ${webCodecsDecoder.state}), skipping audio from ${userID}`);
-                        webCodecsDecoder = null; // Force recreation on next packet
-                        return;
-                    }
-
-                    // Standard Opus frame duration is 20ms (20000 microseconds)
-                    // Individual Opus packets are typically 20ms frames
-                    const estimatedDuration = 20000;
-                    
-                    // Create EncodedAudioChunk for WebCodecs decoder with proper timestamp
-                    const encodedChunk = new EncodedAudioChunk({
-                        type: 'key', // Required property for Opus frames
-                        timestamp: decoderTimestamp, // Use incrementing timestamp
-                        data: audioData,
-                        duration: estimatedDuration
-                    });
-                    
-                    // Increment timestamp for next chunk based on estimated duration
-                    decoderTimestamp += estimatedDuration;
-                    
-                    webCodecsDecoder.decode(encodedChunk);
-                    // Note: decoded audio will be handled in the decoder's output callback
-                } catch (err) {
-                    addMessage(`❌ Failed to decode Opus from ${userID}: ${err.message}`);
-                    // Reset decoder on any decode error for next attempt
-                    if (err.message.includes('closed codec') || err.message.includes('unconfigured codec')) {
-                        webCodecsDecoder = null;
-                        addMessage(`🔧 Decoder error detected, will recreate on next audio`);
-                    }
-                }
-
-            } catch (error) {
-                addMessage(`❌ Error processing received audio from ${userID}: ${error.message}`);
-            }
-        }
-
-        // --- WebSocket and UI Functions ---
-
-        function connect() {
-            if (ws) return;
-            
-            ws = new WebSocket('ws://localhost:8080/ws');
-            
-            ws.onopen = function() {
-                connectionStatus.classList.add('connected');
-                connectionText.textContent = 'Connected';
-                addMessage('Connected to server');
-                updateStats();
-            };
-            
-            ws.onmessage = function(event) {
-                if (event.data instanceof ArrayBuffer) {
-                    const userID = currentAudioMetadata ? currentAudioMetadata.user_id : 'unknown';
-                    playReceivedAudio(event.data, userID, currentAudioMetadata);
-                    currentAudioMetadata = null; // Clear after use
-                    
-                } else if (event.data instanceof Blob) {
-                    const userID = currentAudioMetadata ? currentAudioMetadata.user_id : 'unknown';
-                    const metadataForBlob = currentAudioMetadata;
-                    currentAudioMetadata = null;
-                    
-                    event.data.arrayBuffer().then(buffer => {
-                        playReceivedAudio(buffer, userID, metadataForBlob);
-                    });
-                    
-                } else if (typeof event.data === 'string') {
-                    try {
-                        const data = JSON.parse(event.data);
-                        
-                        if (data.type === 'audio_data') {
-                            currentAudioMetadata = data; // Store for the next binary frame
-                            return;
-                        }
-                        
-                        handleServerEvent(data);
-                    } catch (e) {
-                        addMessage('Received non-JSON text: ' + event.data);
-                    }
-                } else {
-                    addMessage('Received unknown data type: ' + typeof event.data);
-                }
-            };
-            
-            ws.onclose = function() {
-                connectionStatus.classList.remove('connected');
-                connectionText.textContent = 'Disconnected';
-                userInfo.textContent = '';
-                addMessage('Disconnected from server. Reconnecting in 3s...');
-                pttButton.disabled = true;
-                ws = null;
-                setTimeout(connect, 3000);
-            };
-            
-            ws.onerror = function(error) {
-                addMessage('Connection error: ' + JSON.stringify(error));
-            };
-        }
-
-        function handleServerEvent(event) {
-            addMessage(`Event: ${event.type} from ${event.user_id ? event.user_id.substring(0,8) : 'server'} ${event.data ? '- ' + JSON.stringify(event.data) : ''}`);
-            
-            switch (event.type) {
-                case 'user_join':
-                    if (event.user_id && event.data && event.data.username) {
-                        if (!currentUser) { // Assume first join event is for us
-                            if (event.user_id) {
-                                currentUser = {
-                                    id: event.user_id,
-                                    username: event.data.username
-                                };
-                                userInfo.textContent = ` - ${event.data.username}`;
-                            }
-                        }
-                    }
-                    updateStats();
-                    updateUsersList();
-                    break;
-                    
-                case 'user_leave':
-                    updateStats();
-                    updateUsersList();
-                    break;
-                    
-                case 'channel_join':
-                    if (event.user_id === (currentUser ? currentUser.id : '')) {
-                        currentChannel = event.channel_id;
-                        document.getElementById('channel-input').value = currentChannel;
-                    }
-                    updatePTTButtonState();
-                    updateStats();
-                    updateChannelsList();
-                    updateUsersList();
-                    break;
-                    
-                case 'channel_leave':
-                    if (event.user_id === (currentUser ? currentUser.id : '')) {
-                        currentChannel = '';
-                        document.getElementById('channel-input').value = '';
-                    }
-                    updatePTTButtonState();
-                    updateStats();
-                    updateChannelsList();
-                    updateUsersList();
-                    break;
-                    
-                case 'ptt_start':
-                    addMessage(`🎙️ ${event.data.username} started talking in ${event.channel_id}`);
-                    highlightTalkingUser(event.user_id, true);
-                    // Start reception stats if someone else is talking
-                    if (event.user_id !== (currentUser ? currentUser.id : '')) {
-                        startReceptionStats();
-                    }
-                    break;
-                    
-                case 'ptt_end':
-                    addMessage(`🔇 ${event.data.username} stopped talking in ${event.channel_id}`);
-                    highlightTalkingUser(event.user_id, false);
-                    // Stop reception stats if someone else stopped talking
-                    if (event.user_id !== (currentUser ? currentUser.id : '')) {
-                        stopReceptionStats();
-                    }
-                    break;
-                    
-                case 'heartbeat':
-                    // Silent heartbeat response
-                    break;
-            }
-        }
-
-        function updatePTTButtonState() {
-            if (!webCodecsSupported) {
-                pttButton.disabled = true;
-                pttButton.textContent = 'WEBCODECS NOT SUPPORTED';
-            } else if (!microphonePermission) {
-                pttButton.disabled = true;
-                pttButton.textContent = 'GRANT MIC PERMISSION';
-            } else if (!currentChannel) {
-                pttButton.disabled = true;
-                pttButton.textContent = 'JOIN A CHANNEL TO TALK';
-            } else if (microphonePermission && currentChannel && ws && ws.readyState === WebSocket.OPEN) {
-                pttButton.disabled = false;
-                pttButton.textContent = 'HOLD TO TALK (OPUS)';
-            } else {
-                pttButton.disabled = true;
-                pttButton.textContent = 'CONNECTING...';
-            }
-        }
-
-        function sendEvent(eventType, data = {}) {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                const event = {
-                    type: eventType,
-                    channel_id: currentChannel,
-                    timestamp: new Date().toISOString(),
-                    data: data
-                };
-                ws.send(JSON.stringify(event));
-            }
-        }
-
-        function joinChannel() {
-            const channelName = document.getElementById('channel-input').value.trim();
-            if (!channelName) { 
-                alert('Please enter a channel name');
-                return;
-            }
-            
-            sendEvent('channel_join', { channel_name: channelName });
-        }
-
-        function leaveChannel() {
-            if (currentChannel) {
-                sendEvent('channel_leave');
-            }
-        }
-
-        function startPTT() {
-            if (pttButton.disabled || isPTTActive) return;
-            
-            isPTTActive = true;
-            pttButton.classList.add('active');
-            
-            // Start transmission stats tracking
-            startTransmissionStats();
-            
-            if (microphonePermission) {
-                pttButton.textContent = 'TRANSMITTING...';
-                startAudioCapture();
-            } else {
-                pttButton.textContent = 'TRANSMITTING EVENT...';
-            }
-            
-            sendEvent('ptt_start');
-        }
-
-        function endPTT() {
-            if (!isPTTActive) return;
-            
-            isPTTActive = false;
-            pttButton.classList.remove('active');
-            
-            // Stop transmission stats tracking
-            stopTransmissionStats();
-            
-            if (microphonePermission) {
-                stopAudioCapture();
-            }
-            
-            updatePTTButtonState();
-            sendEvent('ptt_end');
-        }
-
-        function updateStats() {
-            fetch('/api/stats')
-                .then(response => response.json())
-                .then(stats => {
-                    document.getElementById('active-channels').textContent = stats.active_channels;
-                    document.getElementById('connected-users').textContent = stats.active_users;
-                    document.getElementById('total-clients').textContent = stats.connected_clients;
-                })
-                .catch(err => console.error('Failed to fetch stats:', err));
-        }
-
-        function updateChannelsList() {
-            fetch('/api/channels')
-                .then(response => response.json())
-                .then(data => {
-                    const channelsList = document.getElementById('channels-list');
-                    if (data.channels && data.channels.length > 0) {
-                        channelsList.innerHTML = data.channels.map(channel => 
-                            `<div class="channel-item ${channel.id === currentChannel ? 'active' : ''}" onclick="selectChannel('${channel.id}')">
-                                ${channel.name} (${channel.users.length} users)
-                            </div>`
-                        ).join('');
-                    } else {
-                        channelsList.innerHTML = '<div style="color: #999; text-align: center; padding: 20px;">No active channels</div>';
-                    }
-                })
-                .catch(err => console.error('Failed to fetch channels:', err));
-        }
-
-        function updateUsersList() {
-            fetch('/api/users')
-                .then(response => response.json())
-                .then(data => {
-                    const usersList = document.getElementById('users-list');
-                    if (data.users && data.users.length > 0) {
-                        usersList.innerHTML = data.users.map(user => 
-                            `<div class="user-item ${user.is_active ? 'active' : ''}" id="user-${user.id}">
-                                ${user.username}${user.channel ? ` (${user.channel})` : ''}
-                            </div>`
-                        ).join('');
-                    } else {
-                        usersList.innerHTML = '<div style="color: #999; text-align: center; padding: 20px;">No connected users</div>';
-                    }
-                })
-                .catch(err => console.error('Failed to fetch users:', err));
-        }
-
-        function selectChannel(channelId) {
-            document.getElementById('channel-input').value = channelId;
-            joinChannel();
-        }
-
-        function highlightTalkingUser(userId, isTalking) {
-            const userElement = document.getElementById(`user-${userId}`);
-            if (userElement) {
-                if (isTalking) {
-                    userElement.classList.add('talking');
-                } else {
-                    userElement.classList.remove('talking');
-                }
-            }
-        }
-
-        function addMessage(message) {
-            const div = document.createElement('div');
-            div.textContent = new Date().toLocaleTimeString() + ' - ' + message;
-            messagesDiv.appendChild(div);
-            messagesDiv.scrollTop = messagesDiv.scrollHeight;
-        }
-
-        // Keyboard shortcuts
-        document.addEventListener('keydown', function(e) {
-            if (e.code === 'Space' && !e.repeat && !pttButton.disabled) {
-                e.preventDefault();
-                pttButton.dispatchEvent(new MouseEvent('mousedown'));
-            }
-        });
-
-        document.addEventListener('keyup', function(e) {
-            if (e.code === 'Space') {
-                e.preventDefault();
-                pttButton.dispatchEvent(new MouseEvent('mouseup'));
-            }
-        });
-
-        window.addEventListener('keydown', function(e) {
-            if(e.keyCode === 32 && e.target === document.body) {
-                e.preventDefault();
-            }
-        });
-
-        window.onload = function() {
-            connect();
-            initializeAudio();
-            updateOpusStatus(); // Initialize Opus status display
-            setInterval(updateStats, 2000);
-            setInterval(updateChannelsList, 3000);
-            setInterval(updateUsersList, 3000);
-        };
-    </script>
+    <script src="/static/dashboard.js"></script>
 </body>
 </html>
