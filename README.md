@@ -59,6 +59,24 @@ go run cmd/server/main.go
 4. **Hold the PTT button** to transmit
 5. **Watch real-time stats** during conversations
 
+### Using the CLI Streaming Tool
+
+```bash
+# Build the CLI tool
+go build -o whotalkie-stream ./cmd/whotalkie-stream
+
+# Stream audio file to WhoTalkie
+ffmpeg -i input.mp3 -c:a libopus -b:a 32k -f opus - | ./whotalkie-stream
+
+# Stream live radio/internet stream
+ffmpeg -i https://stream.example.com/radio -c:a libopus -b:a 32k -f opus - | \
+    ./whotalkie-stream -channel "music" -alias "Radio Stream"
+
+# Stream from microphone (live)
+ffmpeg -f avfoundation -i ":0" -c:a libopus -b:a 32k -f opus - | \
+    ./whotalkie-stream -channel "live" -alias "Live Stream"
+```
+
 ## 🏗️ Architecture
 
 ### Audio Pipeline
@@ -106,6 +124,7 @@ whotalkie/
 - **Audio Statistics** - Real-time performance monitoring
 - **Multi-User Mixing** - Simultaneous audio stream playback
 - **Channel Management** - User presence and channel switching
+- **CLI Streaming Tool** - Publish-only client for external audio sources
 
 ### Browser Support Matrix
 | Browser | WebCodecs | Opus Support | Status |

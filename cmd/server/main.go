@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -154,10 +157,13 @@ func handleAudioData(wsConn *types.WebSocketConnection, metadata *types.PTTEvent
 		return
 	}
 
-	// Broadcast audio to all other users in the channel
+	// Broadcast audio to all other users in the channel (except publish-only clients)
 	for _, channelUser := range channel.Users {
 		if channelUser.ID == wsConn.UserID {
 			continue // Don't send audio back to sender
+		}
+		if channelUser.PublishOnly {
+			continue // Don't send audio to publish-only clients
 		}
 
 		client, exists := stateManager.GetClient(channelUser.ID)
@@ -253,9 +259,24 @@ func handleChannelJoin(event *types.PTTEvent) {
 	}
 	
 	user, _ := stateManager.GetUser(event.UserID)
+	
+	// Handle publish-only mode
+	if publishOnly, ok := event.Data["publish_only"].(bool); ok && publishOnly {
+		user.PublishOnly = true
+		stateManager.UpdateUser(user)
+		log.Printf("User %s (%s) set to publish-only mode", user.Username, user.ID)
+	}
+	
+	// Update username if provided
+	if username, ok := event.Data["username"].(string); ok && username != "" {
+		user.Username = username
+		stateManager.UpdateUser(user)
+	}
+	
 	event.Data = map[string]interface{}{
 		"username":     user.Username,
 		"channel_name": channel.Name,
+		"publish_only": user.PublishOnly,
 	}
 	
 	stateManager.BroadcastEvent(event)
@@ -394,8 +415,33 @@ func main() {
 
 	r.GET("/ws", handleWebSocket)
 
-	log.Println("Starting WhoTalkie server on :8080")
-	if err := r.Run(":8080"); err != nil {
+	// Create HTTP server with graceful shutdown
+	server := &http.Server{
+		Addr:    ":8080",
+		Handler: r,
+	}
+
+	// Handle graceful shutdown
+	go func() {
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+		<-sigChan
+		
+		log.Println("🛑 Shutting down server...")
+		
+		// Give active connections 30 seconds to finish
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		
+		if err := server.Shutdown(ctx); err != nil {
+			log.Printf("Server forced to shutdown: %v", err)
+		} else {
+			log.Println("✅ Server shutdown complete")
+		}
+	}()
+
+	log.Println("Starting WhoTalkie server on :8080 (Ctrl+C to stop)")
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal("Failed to start server:", err)
 	}
 }

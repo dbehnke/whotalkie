@@ -49,6 +49,12 @@ func (m *Manager) GetUser(userID string) (*types.User, bool) {
 	return user, exists
 }
 
+func (m *Manager) UpdateUser(user *types.User) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.users[user.ID] = user
+}
+
 func (m *Manager) GetAllUsers() []*types.User {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

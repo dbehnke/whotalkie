@@ -290,6 +290,9 @@
         let mediaStream = null;
         let nextPlayTime = 0;
         let activeAudioSources = new Map(); // Track audio sources by user ID
+        let decoderTimestamp = 0;
+        let audioBuffer = []; // Buffer for smooth playback
+        let isBuffering = false;
         let audioMixerGain = null;
         let microphonePermission = false;
         
@@ -820,25 +823,76 @@
 
                 if (!pcmData || pcmData.length === 0) return;
 
-                const audioBuffer = audioContext.createBuffer(1, pcmData.length, sampleRate);
-                audioBuffer.getChannelData(0).set(pcmData);
-
-                const userGain = audioContext.createGain();
-                userGain.gain.value = 0.8;
-
-                const source = audioContext.createBufferSource();
-                source.buffer = audioBuffer;
-                source.connect(userGain);
-                userGain.connect(audioMixerGain);
-
-                source.start();
-
-                source.onended = () => {
-                    userGain.disconnect();
-                };
+                // Add to buffer for smooth playback
+                audioBuffer.push({ pcmData, sampleRate, userID });
+                
+                // Start buffered playback if not already running
+                if (!isBuffering) {
+                    processAudioBuffer();
+                }
 
             } catch (error) {
                 addMessage(`⚠️ Audio playback failed for user ${userID}: ${error.message}`);
+            }
+        }
+        
+        async function processAudioBuffer() {
+            if (isBuffering) return;
+            isBuffering = true;
+            
+            try {
+                while (audioBuffer.length > 0) {
+                    // Wait for buffer to build up slightly for smoother playback
+                    if (audioBuffer.length < 3 && audioBuffer.length > 0) {
+                        await new Promise(resolve => setTimeout(resolve, 10)); // 10ms wait
+                        continue;
+                    }
+                    
+                    if (audioBuffer.length === 0) break;
+                    
+                    const { pcmData, sampleRate, userID } = audioBuffer.shift();
+                    
+                    const audioBufferNode = audioContext.createBuffer(1, pcmData.length, sampleRate);
+                    audioBufferNode.getChannelData(0).set(pcmData);
+
+                    const userGain = audioContext.createGain();
+                    userGain.gain.value = 0.8;
+
+                    const source = audioContext.createBufferSource();
+                    source.buffer = audioBufferNode;
+                    source.connect(userGain);
+                    userGain.connect(audioMixerGain);
+
+                    // Schedule proper playback timing for streaming audio
+                    const currentTime = audioContext.currentTime;
+                    const bufferTime = 0.1; // 100ms buffer for smoother playback
+                    
+                    if (nextPlayTime < currentTime + bufferTime) {
+                        nextPlayTime = currentTime + bufferTime;
+                    }
+                    
+                    source.start(nextPlayTime);
+                    
+                    // Update next play time based on audio duration (20ms for Opus frames)
+                    const frameDuration = pcmData.length / sampleRate;
+                    nextPlayTime += frameDuration;
+
+                    source.onended = () => {
+                        userGain.disconnect();
+                    };
+                    
+                    // Small delay to prevent overwhelming the audio system
+                    await new Promise(resolve => setTimeout(resolve, 5));
+                }
+            } catch (error) {
+                addMessage(`⚠️ Audio buffer processing failed: ${error.message}`);
+            } finally {
+                isBuffering = false;
+                
+                // Continue processing if more audio arrived while we were processing
+                if (audioBuffer.length > 0) {
+                    processAudioBuffer();
+                }
             }
         }
 
@@ -861,24 +915,74 @@
                     return;
                 }
                 
-                if (!webCodecsSupported || !webCodecsDecoder) {
-                    addMessage(`⚠️ WebCodecs Opus decoder not ready, skipping audio from ${userID}`);
+                if (!webCodecsSupported) {
+                    addMessage(`⚠️ WebCodecs not supported, skipping audio from ${userID}`);
                     return;
+                }
+
+                // Ensure decoder is ready and recreate if needed
+                if (!webCodecsDecoder || webCodecsDecoder.state === 'closed' || webCodecsDecoder.state === 'unconfigured') {
+                    try {
+                        webCodecsDecoder = new AudioDecoder({
+                            output: (audioData) => {
+                                playDecodedAudio(audioData);
+                            },
+                            error: (err) => {
+                                addMessage(`❌ Decoder error from ${userID}: ${err.message}`);
+                                // Reset decoder on error for next attempt
+                                webCodecsDecoder = null;
+                            }
+                        });
+                        
+                        // Configure decoder for Opus without description (raw Opus packets)
+                        webCodecsDecoder.configure({
+                            codec: 'opus',
+                            sampleRate: OPUS_SAMPLE_RATE,
+                            numberOfChannels: 1
+                        });
+                        
+                        addMessage(`🔧 Recreated WebCodecs decoder for ${userID}`);
+                        // Reset timestamp and playback timing for new decoder instance
+                        decoderTimestamp = 0;
+                        nextPlayTime = 0;
+                    } catch (err) {
+                        addMessage(`❌ Failed to recreate decoder for ${userID}: ${err.message}`);
+                        return;
+                    }
                 }
                 
                 try {
-                    // Create EncodedAudioChunk for WebCodecs decoder
+                    // Check decoder state before attempting decode
+                    if (webCodecsDecoder.state !== 'configured') {
+                        addMessage(`❌ Decoder not configured (state: ${webCodecsDecoder.state}), skipping audio from ${userID}`);
+                        webCodecsDecoder = null; // Force recreation on next packet
+                        return;
+                    }
+
+                    // Standard Opus frame duration is 20ms (20000 microseconds)
+                    // Individual Opus packets are typically 20ms frames
+                    const estimatedDuration = 20000;
+                    
+                    // Create EncodedAudioChunk for WebCodecs decoder with proper timestamp
                     const encodedChunk = new EncodedAudioChunk({
-                        type: 'key', // Opus frames are typically self-contained
-                        timestamp: 0, // Let decoder handle timing
+                        type: 'key', // Required property for Opus frames
+                        timestamp: decoderTimestamp, // Use incrementing timestamp
                         data: audioData,
-                        duration: null // Let decoder determine duration
+                        duration: estimatedDuration
                     });
+                    
+                    // Increment timestamp for next chunk based on estimated duration
+                    decoderTimestamp += estimatedDuration;
                     
                     webCodecsDecoder.decode(encodedChunk);
                     // Note: decoded audio will be handled in the decoder's output callback
                 } catch (err) {
                     addMessage(`❌ Failed to decode Opus from ${userID}: ${err.message}`);
+                    // Reset decoder on any decode error for next attempt
+                    if (err.message.includes('closed codec') || err.message.includes('unconfigured codec')) {
+                        webCodecsDecoder = null;
+                        addMessage(`🔧 Decoder error detected, will recreate on next audio`);
+                    }
                 }
 
             } catch (error) {

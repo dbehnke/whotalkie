@@ -7,10 +7,11 @@ import (
 )
 
 type User struct {
-	ID       string `json:"id"`
-	Username string `json:"username"`
-	Channel  string `json:"channel"`
-	IsActive bool   `json:"is_active"`
+	ID          string `json:"id"`
+	Username    string `json:"username"`
+	Channel     string `json:"channel"`
+	IsActive    bool   `json:"is_active"`
+	PublishOnly bool   `json:"publish_only,omitempty"`
 }
 
 type Channel struct {
