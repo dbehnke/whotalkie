@@ -22,6 +22,11 @@ import (
 
 var stateManager *state.Manager
 
+// Security and performance constants
+const (
+	MaxAudioChunkSize = 1024 * 1024 // 1MB limit for audio chunks to prevent memory exhaustion
+)
+
 // isValidChannelName validates channel names to prevent injection attacks
 func isValidChannelName(channelName string) bool {
 	// Security: Channel name validation to prevent injection attacks
@@ -177,8 +182,7 @@ func handleClientRead(wsConn *types.WebSocketConnection) {
 			if event.Type == string(types.EventAudioData) {
 				// Security: Validate chunk size to prevent memory exhaustion
 				if chunkSize, ok := event.Data["chunk_size"].(float64); ok {
-					const maxChunkSize = 1024 * 1024 // 1MB limit
-					if chunkSize > maxChunkSize || chunkSize <= 0 {
+					if chunkSize > MaxAudioChunkSize || chunkSize <= 0 {
 						log.Printf("SECURITY: Invalid chunk size rejected from user %s: %v bytes", wsConn.UserID, chunkSize)
 						continue
 					}
@@ -197,8 +201,7 @@ func handleClientRead(wsConn *types.WebSocketConnection) {
 			
 		case websocket.MessageBinary:
 			// Security: Limit binary message size to prevent memory exhaustion
-			const maxAudioChunkSize = 1024 * 1024 // 1MB limit
-			if len(message) > maxAudioChunkSize {
+			if len(message) > MaxAudioChunkSize {
 				log.Printf("SECURITY: Rejecting oversized binary message from user %s: %d bytes", wsConn.UserID, len(message))
 				continue
 			}

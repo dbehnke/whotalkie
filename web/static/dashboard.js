@@ -20,8 +20,19 @@ let webCodecsEncoder = null;
 let webCodecsDecoder = null;
 const OPUS_SAMPLE_RATE = 48000;
 const OPUS_BITRATE = 32000;
-const BUFFER_MAX_SIZE = 10; // Maximum buffer size to prevent memory issues
-const BUFFER_TARGET_SIZE = 3; // Target buffer size for smooth playback
+
+// Audio buffer configuration constants
+// These values balance latency vs stability for real-time PTT communication:
+// - Lower values = lower latency but higher chance of audio dropouts
+// - Higher values = more stable playback but increased latency
+const BUFFER_MAX_SIZE = 10;     // Maximum buffer size (prevents memory buildup during network issues)
+const BUFFER_TARGET_SIZE = 3;   // Target buffer size (optimal balance: ~60ms latency with 20ms frames)
+
+// Audio validation constants
+const MIN_RECEPTION_DURATION = 0.1; // Minimum duration (seconds) for valid audio reception data
+
+// Logging configuration
+const AUDIO_CHUNK_LOG_SAMPLE_RATE = 0.05; // Sample rate for audio chunk logging (5% to reduce noise)
 let webCodecsSupported = false;
 let audioTimestamp = 0; // Track continuous timestamp
 
@@ -190,7 +201,7 @@ function updateStatsDisplay() {
 }
 
 function isValidReceptionState(duration, bytes) {
-    return duration > 0.1 && bytes > 0;
+    return duration > MIN_RECEPTION_DURATION && bytes > 0;
 }
 
 function calculateSafeBitrate(duration, bytes, lastValidBitrate) {
@@ -460,7 +471,7 @@ function sendOpusAudioChunk(encodedChunk) {
         // Update transmission stats
         audioStats.transmittedBytes += byteLength;
         
-        if (Math.random() < 0.05) { // Only log 5% of chunks
+        if (Math.random() < AUDIO_CHUNK_LOG_SAMPLE_RATE) {
             addMessage('📤 Sent Opus chunk: ' + byteLength + ' bytes');
         }
     } else {
