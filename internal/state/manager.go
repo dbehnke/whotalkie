@@ -110,14 +110,15 @@ func (m *Manager) CreateChannel(channelID, name string) *types.Channel {
 	defer m.mu.Unlock()
 	
 	channel := &types.Channel{
-		ID:             channelID,
-		Name:           name,
-		Users:          []types.User{},
-		ActiveSpeakers: make(map[string]types.SpeakerState),
-		CreatedAt:      time.Now(),
-		MaxUsers:       50,
-		IsActive:       true,
-		Description:    "",
+		ID:               channelID,
+		Name:             name,
+		Users:            []types.User{},
+		ActiveSpeakers:   make(map[string]types.SpeakerState),
+		CreatedAt:        time.Now(),
+		MaxUsers:         50,
+		IsActive:         true,
+		Description:      "",
+		PublishOnlyCount: 0,
 	}
 	
 	m.channels[channelID] = channel
@@ -179,6 +180,12 @@ func (m *Manager) JoinChannel(userID, channelID string) error {
 	found := false
 	for i, channelUser := range channel.Users {
 		if channelUser.ID == userID {
+			// Update publish-only count if status changed
+			if channelUser.PublishOnly && !user.PublishOnly {
+				channel.PublishOnlyCount--
+			} else if !channelUser.PublishOnly && user.PublishOnly {
+				channel.PublishOnlyCount++
+			}
 			channel.Users[i] = *user
 			found = true
 			break
@@ -187,6 +194,9 @@ func (m *Manager) JoinChannel(userID, channelID string) error {
 	
 	if !found {
 		channel.Users = append(channel.Users, *user)
+		if user.PublishOnly {
+			channel.PublishOnlyCount++
+		}
 	}
 	
 	return nil
@@ -211,6 +221,9 @@ func (m *Manager) removeUserFromChannel(userID, channelID string) error {
 	
 	for i, channelUser := range channel.Users {
 		if channelUser.ID == userID {
+			if channelUser.PublishOnly {
+				channel.PublishOnlyCount--
+			}
 			channel.Users = append(channel.Users[:i], channel.Users[i+1:]...)
 			break
 		}
@@ -223,13 +236,9 @@ func (m *Manager) removeUserFromChannel(userID, channelID string) error {
 }
 
 func (m *Manager) BroadcastEvent(event *types.PTTEvent) {
-	// Critical events (PTT, user join/leave) should be blocking to ensure delivery
-	isCritical := event.Type == string(types.EventPTTStart) || 
-				 event.Type == string(types.EventPTTEnd) ||
-				 event.Type == string(types.EventUserJoin) ||
-				 event.Type == string(types.EventUserLeave) ||
-				 event.Type == string(types.EventChannelJoin) ||
-				 event.Type == string(types.EventChannelLeave)
+	// Use the IsCritical method for cleaner event type checking
+	eventType := types.PTTEventType(event.Type)
+	isCritical := eventType.IsCritical()
 	
 	if isCritical {
 		// Use context with timeout for critical events to avoid deadlocks

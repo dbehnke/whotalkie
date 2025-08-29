@@ -337,13 +337,10 @@ func handlePTTStart(event *types.PTTEvent) {
 	// normal users become listen-only to maintain broadcast/monitoring paradigm.
 	// This enables use cases like live radio, security monitoring, conference playback.
 	// See README.md "Channel Behavior & Broadcast Mode" for full documentation.
-	if !user.PublishOnly {
-		for _, u := range channel.Users {
-			if u.PublishOnly {
-				log.Printf("PTT blocked for user %s in channel %s because publish-only user %s is present (broadcast mode)", user.Username, channel.ID, u.Username)
-				return
-			}
-		}
+	if !user.PublishOnly && channel.PublishOnlyCount > 0 {
+		log.Printf("PTT blocked for user %s in channel %s because %d publish-only user(s) present (broadcast mode)", 
+			user.Username, channel.ID, channel.PublishOnlyCount)
+		return
 	}
 
 	// Add user to active speakers

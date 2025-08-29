@@ -22,14 +22,15 @@ type SpeakerState struct {
 }
 
 type Channel struct {
-	ID             string                  `json:"id"`
-	Name           string                  `json:"name"`
-	Users          []User                  `json:"users"`
-	ActiveSpeakers map[string]SpeakerState `json:"active_speakers"`
-	CreatedAt      time.Time               `json:"created_at"`
-	MaxUsers       int                     `json:"max_users"`
-	IsActive       bool                    `json:"is_active"`
-	Description    string                  `json:"description,omitempty"`
+	ID               string                  `json:"id"`
+	Name             string                  `json:"name"`
+	Users            []User                  `json:"users"`
+	ActiveSpeakers   map[string]SpeakerState `json:"active_speakers"`
+	CreatedAt        time.Time               `json:"created_at"`
+	MaxUsers         int                     `json:"max_users"`
+	IsActive         bool                    `json:"is_active"`
+	Description      string                  `json:"description,omitempty"`
+	PublishOnlyCount int                     `json:"publish_only_count,omitempty"`
 }
 
 type PTTEvent struct {
@@ -64,6 +65,16 @@ const (
 	EventAudioData    PTTEventType = "audio_data"
 	EventHeartbeat    PTTEventType = "heartbeat"
 )
+
+// IsCritical returns true if the event type is critical and should be delivered with timeout protection
+func (e PTTEventType) IsCritical() bool {
+	switch e {
+	case EventPTTStart, EventPTTEnd, EventUserJoin, EventUserLeave, EventChannelJoin, EventChannelLeave:
+		return true
+	default:
+		return false
+	}
+}
 
 type ServerStats struct {
 	TotalUsers       int `json:"total_users"`

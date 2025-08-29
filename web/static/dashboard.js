@@ -174,28 +174,15 @@ function updateStatsDisplay() {
         
         audioStats.receptionDuration = (now - audioStats.receptionStartTime) / 1000;
         
-        // More robust bitrate calculation with extensive validation
-        let calculatedBitrate = 0;
-        
-        // Validate all input values
+        // Calculate bitrate using extracted validation functions
         const duration = audioStats.receptionDuration;
         const bytes = audioStats.receivedBytes;
         
-        // Simple bitrate calculation with last-valid-value fallback
-        if (duration > 0.1 && bytes > 0) {
-            calculatedBitrate = (bytes * 8) / (duration * 1000);
-            
-            // If result is valid, use it and store as last valid value
-            if (isFinite(calculatedBitrate) && calculatedBitrate >= 0) {
-                audioStats.lastValidRxBitrate = calculatedBitrate;
-                audioStats.currentReceiveBitrate = calculatedBitrate;
-            } else {
-                // Use last valid value if current calculation is invalid
-                audioStats.currentReceiveBitrate = audioStats.lastValidRxBitrate;
-            }
-        } else {
-            // Use last valid value when no data yet
-            audioStats.currentReceiveBitrate = audioStats.lastValidRxBitrate;
+        audioStats.currentReceiveBitrate = calculateSafeBitrate(duration, bytes, audioStats.lastValidRxBitrate);
+        
+        // Store as last valid value if current calculation succeeded
+        if (isValidReceptionState(duration, bytes) && audioStats.currentReceiveBitrate > 0) {
+            audioStats.lastValidRxBitrate = audioStats.currentReceiveBitrate;
         }
         
         // Simple display updates using last valid values
@@ -207,6 +194,24 @@ function updateStatsDisplay() {
         document.getElementById('rx-bitrate').textContent = safeBitrate + ' kbps';
         document.getElementById('rx-source').textContent = audioStats.currentReceivingSource || 'Unknown';
     }
+}
+
+function isValidReceptionState(duration, bytes) {
+    return duration > 0.1 && bytes > 0;
+}
+
+function calculateSafeBitrate(duration, bytes, lastValidBitrate) {
+    if (!isValidReceptionState(duration, bytes)) {
+        return lastValidBitrate || 0;
+    }
+    
+    const calculatedBitrate = (bytes * 8) / (duration * 1000);
+    
+    if (isFinite(calculatedBitrate) && calculatedBitrate >= 0) {
+        return calculatedBitrate;
+    }
+    
+    return lastValidBitrate || 0;
 }
 
 function formatBytes(bytes) {
@@ -565,11 +570,18 @@ async function playDecodedAudio(audioData) {
 
         // Important: close AudioData to free memory
         audioData.close();
+        audioData = null; // Mark as cleaned up
         
     } catch (error) {
         addMessage(`❌ Error playing decoded audio: ${error.message}`);
-        if (audioData) {
-            audioData.close(); // Ensure cleanup even on error
+    } finally {
+        // Ensure cleanup happens regardless of success or failure
+        if (audioData && typeof audioData.close === 'function') {
+            try {
+                audioData.close();
+            } catch (closeError) {
+                console.warn('Error during AudioData cleanup:', closeError);
+            }
         }
     }
 }
@@ -626,8 +638,13 @@ async function playAudioWithMixing(pcmData, sampleRate, userID) {
 
         if (!pcmData || pcmData.length === 0) return;
 
-        // Add to buffer for smooth playback
-        audioBuffer.push({ pcmData, sampleRate, userID });
+        // Add to buffer for smooth playback - use consistent structure
+        audioBuffer.push({ 
+            data: pcmData, 
+            sampleRate: sampleRate, 
+            userID: userID,
+            timestamp: performance.now()
+        });
         
         // Start buffered playback if not already running
         if (!isBuffering) {
@@ -653,7 +670,7 @@ async function processAudioBuffer() {
             
             if (audioBuffer.length === 0) break;
             
-            const { pcmData, sampleRate, userID } = audioBuffer.shift();
+            const { data: pcmData, sampleRate, userID } = audioBuffer.shift();
             
             const audioBufferNode = audioContext.createBuffer(1, pcmData.length, sampleRate);
             audioBufferNode.getChannelData(0).set(pcmData);
