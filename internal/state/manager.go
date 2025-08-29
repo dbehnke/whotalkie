@@ -334,13 +334,19 @@ func (m *Manager) GetStats() types.ServerStats {
 // Shutdown gracefully closes the event channel and cleans up resources
 func (m *Manager) Shutdown() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	
 	// Close event channel to signal broadcast goroutine to stop
 	close(m.events)
 	
-	// Close all client connections
+	// Snapshot client connections to avoid deadlocks
+	clients := make([]*types.WebSocketConnection, 0, len(m.clients))
 	for _, client := range m.clients {
+		clients = append(clients, client)
+	}
+	m.mu.Unlock()
+	
+	// Close all client Send channels outside the lock to avoid deadlocks
+	for _, client := range clients {
 		close(client.Send)
 	}
 	

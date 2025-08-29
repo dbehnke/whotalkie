@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
@@ -39,9 +40,9 @@ func validateChunkSize(eventData map[string]interface{}, userID string) (int64, 
 	var chunkSizeInt int64
 	switch v := chunkSizeRaw.(type) {
 	case float64:
-		// Accept only if it's an integer value (no fractional part)
-		if v != float64(int64(v)) {
-			log.Printf("SECURITY: Non-integer chunk size rejected from user %s: %v", userID, v)
+		// Validate bounds and integer precision for float64
+		if v < 0 || v > math.MaxInt64 || math.Trunc(v) != v {
+			log.Printf("SECURITY: Invalid float64 chunk size rejected from user %s: %v", userID, v)
 			return 0, false
 		}
 		chunkSizeInt = int64(v)

@@ -10,6 +10,10 @@
             --main-container-width: 1000px;
             --container-padding: 20px;
             --border-radius: 8px;
+            /* Channel border specifications for consistent design */
+            --channel-active-border: 1px solid #1976D2;
+            --channel-talking-border: 2px solid #4CAF50;
+            --channel-active-talking-border: 1px solid #45a049;
         }
         
         body {
@@ -107,20 +111,20 @@
         .channel-card.active {
             background: #2196F3;
             color: white;
-            border-color: #1976D2;
+            border: var(--channel-active-border);
         }
         /* When we're in the channel and it's talking - green background with white fonts */
         .channel-card.active.talking {
             background: #4CAF50;
             color: white;
-            border: 1px solid #45a049;
+            border: var(--channel-active-talking-border);
         }
         
         /* When we're not in the channel but it's talking - keep normal background, just indicate with visual cue */
         .channel-card.talking:not(.active) {
             background: #f8f9fa; /* Keep normal background */
             color: #333; /* Normal text color */
-            border: 2px solid #4CAF50; /* Green border to show activity */
+            border: var(--channel-talking-border); /* Green border to show activity */
         }
         .channel-card.publish-only {
             background: #f2f2f2;

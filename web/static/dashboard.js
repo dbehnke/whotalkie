@@ -51,7 +51,54 @@ function escapeHtml(text) {
     div.textContent = text;
     return div.innerHTML;
 }
+
+// Helper function to create and configure an AudioDecoder
+function createAudioDecoder(onOutput, onError) {
+    const decoder = new AudioDecoder({
+        output: onOutput,
+        error: onError
+    });
+
+    // Configure decoder for Opus without description (raw Opus packets)
+    decoder.configure({
+        codec: 'opus',
+        sampleRate: OPUS_SAMPLE_RATE,
+        numberOfChannels: 1
+    });
+
+    return decoder;
+}
 let audioTimestamp = 0; // Track continuous timestamp
+
+// Cached DOM elements for performance
+let cachedElements = {
+    rxBitrate: null,
+    txBitrate: null,
+    rxDuration: null,
+    txDuration: null,
+    rxBytes: null,
+    txBytes: null,
+    rxChannels: null,
+    rxSource: null,
+    activeChannels: null,
+    connectedUsers: null,
+    totalClients: null
+};
+
+// Initialize cached DOM elements
+function initializeDOMCache() {
+    cachedElements.rxBitrate = document.getElementById('rx-bitrate');
+    cachedElements.txBitrate = document.getElementById('tx-bitrate');
+    cachedElements.rxDuration = document.getElementById('rx-duration');
+    cachedElements.txDuration = document.getElementById('tx-duration');
+    cachedElements.rxBytes = document.getElementById('rx-bytes');
+    cachedElements.txBytes = document.getElementById('tx-bytes');
+    cachedElements.rxChannels = document.getElementById('rx-channels');
+    cachedElements.rxSource = document.getElementById('rx-source');
+    cachedElements.activeChannels = document.getElementById('active-channels');
+    cachedElements.connectedUsers = document.getElementById('connected-users');
+    cachedElements.totalClients = document.getElementById('total-clients');
+}
 
 // Audio statistics tracking
 let audioStats = {
@@ -149,10 +196,8 @@ function updateStatsDisplay() {
     
     // Initialize stats elements if not done already
     if (!audioStats.initialized) {
-        const rxBitrateEl = document.getElementById('rx-bitrate');
-        const txBitrateEl = document.getElementById('tx-bitrate');
-        if (rxBitrateEl) rxBitrateEl.textContent = '0.0 kbps';
-        if (txBitrateEl) txBitrateEl.textContent = '0.0 kbps';
+        if (cachedElements.rxBitrate) cachedElements.rxBitrate.textContent = '0.0 kbps';
+        if (cachedElements.txBitrate) cachedElements.txBitrate.textContent = '0.0 kbps';
         audioStats.initialized = true;
     }
     
@@ -335,20 +380,14 @@ async function initializeWebCodecs() {
         });
         
         // Initialize decoder
-        webCodecsDecoder = new AudioDecoder({
-            output: (audioData) => {
+        webCodecsDecoder = createAudioDecoder(
+            (audioData) => {
                 playDecodedAudio(audioData);
             },
-            error: (err) => {
+            (err) => {
                 addMessage('❌ Decoder error: ' + err.message);
             }
-        });
-        
-        webCodecsDecoder.configure({
-            codec: 'opus',
-            sampleRate: OPUS_SAMPLE_RATE,
-            numberOfChannels: 1
-        });
+        );
         
         webCodecsSupported = true;
         addMessage('✅ WebCodecs Opus encoder/decoder initialized successfully.');
@@ -514,26 +553,6 @@ function initializeAudioMixer() {
     }
 }
 
-function addToAudioBuffer(pcmData, sampleRate, userID) {
-    // Add audio chunk to buffer
-    audioBuffer.push({
-        data: pcmData,
-        sampleRate: sampleRate,
-        userID: userID,
-        timestamp: performance.now()
-    });
-
-    // Limit buffer size to prevent memory buildup
-    if (audioBuffer.length > BUFFER_MAX_SIZE) {
-        audioBuffer.shift(); // Remove oldest chunk
-        addMessage('⚠️ Audio buffer overflow, dropping old chunks');
-    }
-
-    // Start playback when we have enough buffered
-    if (!isPlayingBuffer && audioBuffer.length >= BUFFER_TARGET_SIZE) {
-        startBufferedPlayback();
-    }
-}
 
 async function startBufferedPlayback() {
     if (isPlayingBuffer) return;
@@ -781,23 +800,16 @@ async function playReceivedAudio(audioData, userID = 'unknown', metadata) {
         // Ensure decoder is ready and recreate if needed
         if (!webCodecsDecoder || webCodecsDecoder.state === 'closed' || webCodecsDecoder.state === 'unconfigured') {
             try {
-                webCodecsDecoder = new AudioDecoder({
-                    output: (audioData) => {
+                webCodecsDecoder = createAudioDecoder(
+                    (audioData) => {
                         playDecodedAudio(audioData);
                     },
-                    error: (err) => {
+                    (err) => {
                         addMessage(`❌ Decoder error from ${userID}: ${err.message}`);
                         // Reset decoder on error for next attempt
                         webCodecsDecoder = null;
                     }
-                });
-                
-                // Configure decoder for Opus without description (raw Opus packets)
-                webCodecsDecoder.configure({
-                    codec: 'opus',
-                    sampleRate: OPUS_SAMPLE_RATE,
-                    numberOfChannels: 1
-                });
+                );
                 
                 addMessage(`🔧 Recreated WebCodecs decoder for ${userID}`);
                 // Reset timestamp and playback timing for new decoder instance
@@ -1252,6 +1264,7 @@ window.addEventListener('keydown', function(e) {
 });
 
 window.onload = function() {
+    initializeDOMCache(); // Cache DOM elements for performance
     connect();
     initializeAudio();
     updateOpusStatus(); // Initialize Opus status display
