@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -21,9 +22,68 @@ import (
 
 var stateManager *state.Manager
 
+// isValidChannelName validates channel names to prevent injection attacks
+func isValidChannelName(channelName string) bool {
+	// Security: Channel name validation to prevent injection attacks
+	if len(channelName) == 0 || len(channelName) > 32 {
+		return false
+	}
+	
+	// Allow only alphanumeric characters, hyphens, underscores, and dots
+	for _, char := range channelName {
+		if !((char >= 'a' && char <= 'z') || 
+			 (char >= 'A' && char <= 'Z') || 
+			 (char >= '0' && char <= '9') || 
+			 char == '-' || char == '_' || char == '.') {
+			return false
+		}
+	}
+	
+	// Additional security: prevent directory traversal patterns
+	if strings.Contains(channelName, "..") || 
+	   strings.HasPrefix(channelName, ".") || 
+	   strings.HasSuffix(channelName, ".") {
+		return false
+	}
+	
+	return true
+}
+
+// isValidUsername validates usernames to prevent injection attacks
+func isValidUsername(username string) bool {
+	// Security: Username validation to prevent injection attacks  
+	if len(username) == 0 || len(username) > 32 {
+		return false
+	}
+	
+	// Allow alphanumeric, spaces, hyphens, underscores, and common punctuation
+	for _, char := range username {
+		if !((char >= 'a' && char <= 'z') ||
+			 (char >= 'A' && char <= 'Z') ||
+			 (char >= '0' && char <= '9') ||
+			 char == ' ' || char == '-' || char == '_' ||
+			 char == '.' || char == '(' || char == ')') {
+			return false
+		}
+	}
+	
+	// Prevent usernames that could be confused with system messages
+	lowerUsername := strings.ToLower(strings.TrimSpace(username))
+	forbiddenNames := []string{"system", "server", "admin", "root", "null", "undefined"}
+	for _, forbidden := range forbiddenNames {
+		if lowerUsername == forbidden {
+			return false
+		}
+	}
+	
+	return true
+}
+
 func handleWebSocket(c *gin.Context) {
 	conn, err := websocket.Accept(c.Writer, c.Request, &websocket.AcceptOptions{
-		OriginPatterns: []string{"*"},
+		// Security: Restrict origins to localhost for development
+		// TODO: Configure proper origins for production deployment
+		OriginPatterns: []string{"localhost:*", "127.0.0.1:*", "http://localhost:*", "http://127.0.0.1:*"},
 	})
 	if err != nil {
 		log.Printf("Failed to upgrade connection: %v", err)
@@ -115,6 +175,15 @@ func handleClientRead(wsConn *types.WebSocketConnection) {
 			
 			// Check if this is audio metadata
 			if event.Type == string(types.EventAudioData) {
+				// Security: Validate chunk size to prevent memory exhaustion
+				if chunkSize, ok := event.Data["chunk_size"].(float64); ok {
+					const maxChunkSize = 1024 * 1024 // 1MB limit
+					if chunkSize > maxChunkSize || chunkSize <= 0 {
+						log.Printf("SECURITY: Invalid chunk size rejected from user %s: %v bytes", wsConn.UserID, chunkSize)
+						continue
+					}
+				}
+				
 				expectingAudioData = true
 				audioMetadata = &event
 				format := "pcm" // Default to pcm for backward compatibility
@@ -127,6 +196,13 @@ func handleClientRead(wsConn *types.WebSocketConnection) {
 			}
 			
 		case websocket.MessageBinary:
+			// Security: Limit binary message size to prevent memory exhaustion
+			const maxAudioChunkSize = 1024 * 1024 // 1MB limit
+			if len(message) > maxAudioChunkSize {
+				log.Printf("SECURITY: Rejecting oversized binary message from user %s: %d bytes", wsConn.UserID, len(message))
+				continue
+			}
+			
 			// Handle binary audio data
 			if expectingAudioData && audioMetadata != nil {
 				handleAudioData(wsConn, audioMetadata, message)
@@ -274,6 +350,12 @@ func handleChannelJoin(event *types.PTTEvent) {
 		event.ChannelID = channelID
 	}
 	
+	// Security: Validate channel ID to prevent injection attacks
+	if !isValidChannelName(channelID) {
+		log.Printf("SECURITY: Invalid channel name rejected from user %s: %s", event.UserID, channelID)
+		return
+	}
+	
 	channel := stateManager.GetOrCreateChannel(channelID, channelID)
 	
 	user, _ := stateManager.GetUser(event.UserID)
@@ -286,7 +368,12 @@ func handleChannelJoin(event *types.PTTEvent) {
 	
 	// Update username if provided
 	if username, ok := event.Data["username"].(string); ok && username != "" {
-		user.Username = username
+		// Security: Validate username to prevent injection attacks
+		if isValidUsername(username) {
+			user.Username = username
+		} else {
+			log.Printf("SECURITY: Invalid username rejected from user %s: %s", event.UserID, username)
+		}
 	}
 	
 	// Update user in state
@@ -403,21 +490,33 @@ func handleHeartbeat(event *types.PTTEvent) {
 	}
 }
 
-func broadcastEvents() {
-	for event := range stateManager.GetEventChannel() {
-		eventBytes, err := json.Marshal(event)
-		if err != nil {
-			log.Printf("Failed to marshal event: %v", err)
-			continue
-		}
-		
-		clients := stateManager.GetAllClients()
-		for _, client := range clients {
-			select {
-			case client.Send <- eventBytes:
-			default:
-				log.Printf("Client %s send channel full, skipping", client.UserID)
+func broadcastEvents(ctx context.Context) {
+	for {
+		select {
+		case event, ok := <-stateManager.GetEventChannel():
+			if !ok {
+				// Channel closed, exit gracefully
+				log.Println("Event channel closed, stopping broadcast goroutine")
+				return
 			}
+			
+			eventBytes, err := json.Marshal(event)
+			if err != nil {
+				log.Printf("Failed to marshal event: %v", err)
+				continue
+			}
+			
+			clients := stateManager.GetAllClients()
+			for _, client := range clients {
+				select {
+				case client.Send <- eventBytes:
+				default:
+					log.Printf("Client %s send channel full, skipping", client.UserID)
+				}
+			}
+		case <-ctx.Done():
+			log.Println("Context cancelled, stopping broadcast goroutine")
+			return
 		}
 	}
 }
@@ -425,7 +524,11 @@ func broadcastEvents() {
 func main() {
 	stateManager = state.NewManager()
 	
-	go broadcastEvents()
+	// Create context for graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	
+	go broadcastEvents(ctx)
 	
 	r := gin.Default()
 
@@ -483,11 +586,17 @@ func main() {
 		
 		log.Println("🛑 Shutting down server...")
 		
-		// Give active connections 30 seconds to finish
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
+		// Cancel broadcast context first to stop goroutines
+		cancel()
 		
-		if err := server.Shutdown(ctx); err != nil {
+		// Shutdown state manager and close connections
+		stateManager.Shutdown()
+		
+		// Give active connections 30 seconds to finish
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer shutdownCancel()
+		
+		if err := server.Shutdown(shutdownCtx); err != nil {
 			log.Printf("Server forced to shutdown: %v", err)
 		} else {
 			log.Println("✅ Server shutdown complete")

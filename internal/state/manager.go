@@ -133,10 +133,29 @@ func (m *Manager) GetChannel(channelID string) (*types.Channel, bool) {
 }
 
 func (m *Manager) GetOrCreateChannel(channelID, name string) *types.Channel {
-	if channel, exists := m.GetChannel(channelID); exists {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	
+	// Double-checked locking pattern to prevent race conditions
+	if channel, exists := m.channels[channelID]; exists {
 		return channel
 	}
-	return m.CreateChannel(channelID, name)
+	
+	// Create channel while holding the lock
+	channel := &types.Channel{
+		ID:               channelID,
+		Name:             name,
+		Users:            []types.User{},
+		ActiveSpeakers:   make(map[string]types.SpeakerState),
+		CreatedAt:        time.Now(),
+		MaxUsers:         50,
+		IsActive:         true,
+		Description:      "",
+		PublishOnlyCount: 0,
+	}
+	
+	m.channels[channelID] = channel
+	return channel
 }
 
 func (m *Manager) GetAllChannels() []*types.Channel {
@@ -304,4 +323,20 @@ func (m *Manager) GetStats() types.ServerStats {
 		ActiveChannels:  activeChannels,
 		ConnectedClients: len(m.clients),
 	}
+}
+
+// Shutdown gracefully closes the event channel and cleans up resources
+func (m *Manager) Shutdown() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	
+	// Close event channel to signal broadcast goroutine to stop
+	close(m.events)
+	
+	// Close all client connections
+	for _, client := range m.clients {
+		close(client.Send)
+	}
+	
+	log.Printf("State manager shutdown complete")
 }
