@@ -28,7 +28,7 @@ const OPUS_BITRATE = 32000;
 const FRAME_DURATION_MS = 20;                                                      // Each Opus frame is 20ms
 const BUFFER_TARGET_LATENCY_MS = 60;                                              // Target buffer latency (ms)
 const BUFFER_TARGET_SIZE = Math.round(BUFFER_TARGET_LATENCY_MS / FRAME_DURATION_MS); // Number of frames to buffer for target latency
-const BUFFER_MAX_SIZE = 10;                                                       // Maximum buffer size (prevents memory buildup during network issues)
+const BUFFER_MAX_SIZE = BUFFER_TARGET_SIZE * 3;                                   // Maximum buffer size (3x target for network issue resilience)
 
 // Audio validation constants
 const MIN_RECEPTION_DURATION = 0.1; // Minimum duration (seconds) for valid audio reception data
@@ -43,6 +43,13 @@ function updateElementText(elementId, text) {
     if (element) {
         element.textContent = text;
     }
+}
+
+// Helper function to escape HTML to prevent XSS attacks
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
 }
 let audioTimestamp = 0; // Track continuous timestamp
 
@@ -473,9 +480,14 @@ function sendOpusAudioChunk(encodedChunk) {
         
         ws.send(JSON.stringify(audioEvent));
         
-        // Create array buffer from encoded chunk
-        const buffer = new ArrayBuffer(encodedChunk.byteLength);
-        encodedChunk.copyTo(new Uint8Array(buffer));
+        // Send encoded chunk efficiently
+        let buffer;
+        if (typeof encodedChunk.detach === 'function') {
+            buffer = encodedChunk.detach();
+        } else {
+            buffer = new ArrayBuffer(encodedChunk.byteLength);
+            encodedChunk.copyTo(new Uint8Array(buffer));
+        }
         ws.send(buffer);
         
         // Update transmission stats
@@ -989,8 +1001,8 @@ function handleServerEvent(event) {
             
         case 'error':
             // Handle server-side errors with user-friendly messages
-            const errorMsg = event.data.message || 'Unknown server error';
-            const errorCode = event.data.code || 'UNKNOWN';
+            const errorMsg = escapeHtml(event.data.message || 'Unknown server error');
+            const errorCode = escapeHtml(event.data.code || 'UNKNOWN');
             addMessage(`❌ Server Error [${errorCode}]: ${errorMsg}`);
             
             // Handle specific error types

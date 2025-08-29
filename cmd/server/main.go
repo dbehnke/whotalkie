@@ -61,7 +61,7 @@ func validateChunkSize(eventData map[string]interface{}, userID string) (int64, 
 		}
 		chunkSizeInt = n
 	default:
-		log.Printf("SECURITY: Unexpected chunk size type from user %s: %T", userID, v)
+		log.Printf("SECURITY: Unexpected chunk size type from user %s: value=%v", userID, v)
 		return 0, false
 	}
 	
@@ -244,15 +244,15 @@ func handleClientRead(wsConn *types.WebSocketConnection) {
 				// Security: Validate chunk size to prevent memory exhaustion
 				if chunkSize, valid := validateChunkSize(event.Data, wsConn.UserID); !valid {
 					continue
-				} else {
-					expectingAudioData = true
-					audioMetadata = &event
-					format := "pcm" // Default to pcm for backward compatibility
-					if f, ok := event.Data["format"].(string); ok {
-						format = f
-					}
-					log.Printf("Expecting %s audio data from user %s, size: %d bytes", format, wsConn.UserID, chunkSize)
 				}
+				
+				expectingAudioData = true
+				audioMetadata = &event
+				format := "pcm" // Default to pcm for backward compatibility
+				if f, ok := event.Data["format"].(string); ok {
+					format = f
+				}
+				log.Printf("Expecting %s audio data from user %s, size: %d bytes", format, wsConn.UserID, chunkSize)
 			} else {
 				handleEvent(&event)
 			}
