@@ -274,7 +274,13 @@
             background: #d32f2f;
         }
     </style>
-    <!-- Using WebCodecs API for native Opus support - no external libraries needed -->
+    <!--
+        Using WebCodecs API for native Opus support (no external libraries needed).
+        Browser compatibility: WebCodecs is supported in Chromium-based browsers (e.g., Chrome 94+, Edge 94+).
+        Not supported in Firefox, Safari, or older browsers.
+        Fallback behavior: If WebCodecs is not available, Opus audio features may not work and users may experience limited or no audio functionality.
+        Consider implementing a fallback using a JavaScript Opus decoder (e.g., libopus.js) for broader compatibility if needed.
+    -->
 </head>
 <body>
     <div class="container">

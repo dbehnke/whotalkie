@@ -11,6 +11,7 @@ let activeAudioSources = new Map(); // Track audio sources by user ID
 let decoderTimestamp = 0;
 let audioBuffer = []; // Buffer for smooth playback
 let isBuffering = false;
+let isPlayingBuffer = false; // Track if we're currently playing buffered audio
 let audioMixerGain = null;
 let microphonePermission = false;
 
@@ -917,7 +918,6 @@ function handleServerEvent(event) {
             highlightTalkingUser(event.user_id, true);
             highlightTalkingChannel(event.channel_id, true);
             updateChannelsList(); // Refresh channel list to update speaker count
-            updateChannelsList(); // Refresh channel list to update speaker count
             
             // Track active speakers
             audioStats.activeSpeakers.set(event.user_id, {
@@ -1202,7 +1202,7 @@ document.addEventListener('keyup', function(e) {
 });
 
 window.addEventListener('keydown', function(e) {
-    if(e.keyCode === 32 && e.target === document.body) {
+    if(e.code === 'Space' && e.target === document.body) {
         e.preventDefault();
     }
 });
