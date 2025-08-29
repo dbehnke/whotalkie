@@ -77,9 +77,10 @@ func (e PTTEventType) IsCritical() bool {
 }
 
 type ServerStats struct {
-	TotalUsers       int `json:"total_users"`
-	ActiveUsers      int `json:"active_users"`
-	TotalChannels    int `json:"total_channels"`
-	ActiveChannels   int `json:"active_channels"`
-	ConnectedClients int `json:"connected_clients"`
+	TotalUsers            int `json:"total_users"`
+	ActiveUsers           int `json:"active_users"`
+	TotalChannels         int `json:"total_channels"`
+	ActiveChannels        int `json:"active_channels"`
+	ConnectedClients      int `json:"connected_clients"`
+	DroppedCriticalEvents int `json:"dropped_critical_events"`
 }

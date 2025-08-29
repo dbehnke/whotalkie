@@ -5,18 +5,25 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>WhoTalkie PTT Dashboard</title>
     <style>
+        :root {
+            /* Design system variables for consistent responsive design */
+            --container-max-width: 1000px;
+            --container-padding: 20px;
+            --border-radius: 8px;
+        }
+        
         body {
             font-family: Arial, sans-serif;
             margin: 0;
-            padding: 20px;
+            padding: var(--container-padding);
             background-color: #f5f5f5;
         }
         .container {
-            max-width: 1000px;
+            max-width: var(--container-max-width);
             margin: 0 auto;
             background: white;
-            padding: 20px;
-            border-radius: 8px;
+            padding: var(--container-padding);
+            border-radius: var(--border-radius);
             box-shadow: 0 2px 10px rgba(0,0,0,0.1);
         }
         .header {

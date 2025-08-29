@@ -11,11 +11,12 @@ import (
 )
 
 type Manager struct {
-	mu       sync.RWMutex
-	users    map[string]*types.User
-	channels map[string]*types.Channel
-	clients  map[string]*types.WebSocketConnection
-	events   chan *types.PTTEvent
+	mu                    sync.RWMutex
+	users                 map[string]*types.User
+	channels              map[string]*types.Channel
+	clients               map[string]*types.WebSocketConnection
+	events                chan *types.PTTEvent
+	droppedCriticalEvents int // Track dropped critical events for monitoring
 }
 
 func NewManager() *Manager {
@@ -280,7 +281,11 @@ func (m *Manager) BroadcastEvent(event *types.PTTEvent) {
 		case m.events <- event:
 			// Event delivered successfully
 		case <-ctx.Done():
-			// Log dropped critical event - this should be monitored
+			// Log and track dropped critical event for monitoring
+			m.mu.Lock()
+			m.droppedCriticalEvents++
+			m.mu.Unlock()
+			
 			log.Printf("WARNING: Critical event dropped due to timeout: %s from user %s", 
 				event.Type, event.UserID)
 		}
@@ -317,11 +322,12 @@ func (m *Manager) GetStats() types.ServerStats {
 	}
 	
 	return types.ServerStats{
-		TotalUsers:      len(m.users),
-		ActiveUsers:     activeUsers,
-		TotalChannels:   len(m.channels),
-		ActiveChannels:  activeChannels,
-		ConnectedClients: len(m.clients),
+		TotalUsers:            len(m.users),
+		ActiveUsers:           activeUsers,
+		TotalChannels:         len(m.channels),
+		ActiveChannels:        activeChannels,
+		ConnectedClients:      len(m.clients),
+		DroppedCriticalEvents: m.droppedCriticalEvents,
 	}
 }
 

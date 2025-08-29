@@ -23,10 +23,12 @@ const OPUS_BITRATE = 32000;
 
 // Audio buffer configuration constants
 // These values balance latency vs stability for real-time PTT communication:
-// - Lower values = lower latency but higher chance of audio dropouts
+// - Lower values = lower latency but higher chance of audio dropouts  
 // - Higher values = more stable playback but increased latency
-const BUFFER_MAX_SIZE = 10;     // Maximum buffer size (prevents memory buildup during network issues)
-const BUFFER_TARGET_SIZE = 3;   // Target buffer size (optimal balance: ~60ms latency with 20ms frames)
+const FRAME_DURATION_MS = 20;                                                      // Each Opus frame is 20ms
+const BUFFER_TARGET_LATENCY_MS = 60;                                              // Target buffer latency (ms)
+const BUFFER_TARGET_SIZE = Math.round(BUFFER_TARGET_LATENCY_MS / FRAME_DURATION_MS); // Number of frames to buffer for target latency
+const BUFFER_MAX_SIZE = 10;                                                       // Maximum buffer size (prevents memory buildup during network issues)
 
 // Audio validation constants
 const MIN_RECEPTION_DURATION = 0.1; // Minimum duration (seconds) for valid audio reception data
@@ -583,8 +585,7 @@ async function playDecodedAudio(audioData) {
         const channelText = numberOfChannels === 1 ? 'Mono' : `${numberOfChannels}-channel`;
         updateElementText('rx-channels', `${channelText} @ ${sampleRate}Hz`);
 
-        // Important: close AudioData to free memory
-        audioData.close();
+        // AudioData cleanup is handled in finally block
         
     } catch (error) {
         addMessage(`❌ Error playing decoded audio: ${error.message}`);

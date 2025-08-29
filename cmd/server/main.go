@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -26,6 +27,51 @@ var stateManager *state.Manager
 const (
 	MaxAudioChunkSize = 1024 * 1024 // 1MB limit for audio chunks to prevent memory exhaustion
 )
+
+// validateChunkSize validates chunk size from event data with proper type handling
+func validateChunkSize(eventData map[string]interface{}, userID string) (int64, bool) {
+	chunkSizeRaw, ok := eventData["chunk_size"]
+	if !ok {
+		log.Printf("SECURITY: Missing chunk size from user %s", userID)
+		return 0, false
+	}
+	
+	var chunkSizeInt int64
+	switch v := chunkSizeRaw.(type) {
+	case float64:
+		// Accept only if it's an integer value (no fractional part)
+		if v != float64(int64(v)) {
+			log.Printf("SECURITY: Non-integer chunk size rejected from user %s: %v", userID, v)
+			return 0, false
+		}
+		chunkSizeInt = int64(v)
+	case string:
+		// Try to parse as integer
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			log.Printf("SECURITY: Invalid string chunk size from user %s: %v", userID, v)
+			return 0, false
+		}
+		chunkSizeInt = n
+	case json.Number:
+		n, err := v.Int64()
+		if err != nil {
+			log.Printf("SECURITY: Invalid json.Number chunk size from user %s: %v", userID, v)
+			return 0, false
+		}
+		chunkSizeInt = n
+	default:
+		log.Printf("SECURITY: Unexpected chunk size type from user %s: %T", userID, v)
+		return 0, false
+	}
+	
+	if chunkSizeInt > MaxAudioChunkSize || chunkSizeInt <= 0 {
+		log.Printf("SECURITY: Invalid chunk size rejected from user %s: %v bytes", userID, chunkSizeInt)
+		return 0, false
+	}
+	
+	return chunkSizeInt, true
+}
 
 // sendMessageToClient sends a JSON message to a specific client with error handling
 func sendMessageToClient(userID string, message interface{}) {
@@ -196,20 +242,17 @@ func handleClientRead(wsConn *types.WebSocketConnection) {
 			// Check if this is audio metadata
 			if event.Type == string(types.EventAudioData) {
 				// Security: Validate chunk size to prevent memory exhaustion
-				if chunkSize, ok := event.Data["chunk_size"].(float64); ok {
-					if chunkSize > MaxAudioChunkSize || chunkSize <= 0 {
-						log.Printf("SECURITY: Invalid chunk size rejected from user %s: %v bytes", wsConn.UserID, chunkSize)
-						continue
+				if chunkSize, valid := validateChunkSize(event.Data, wsConn.UserID); !valid {
+					continue
+				} else {
+					expectingAudioData = true
+					audioMetadata = &event
+					format := "pcm" // Default to pcm for backward compatibility
+					if f, ok := event.Data["format"].(string); ok {
+						format = f
 					}
+					log.Printf("Expecting %s audio data from user %s, size: %d bytes", format, wsConn.UserID, chunkSize)
 				}
-				
-				expectingAudioData = true
-				audioMetadata = &event
-				format := "pcm" // Default to pcm for backward compatibility
-				if f, ok := event.Data["format"].(string); ok {
-					format = f
-				}
-				log.Printf("Expecting %s audio data from user %s, size: %v bytes", format, wsConn.UserID, event.Data["chunk_size"])
 			} else {
 				handleEvent(&event)
 			}
@@ -445,7 +488,12 @@ func handlePTTStart(event *types.PTTEvent) {
 	if channel.ActiveSpeakers == nil {
 		channel.ActiveSpeakers = make(map[string]types.SpeakerState)
 	}
-	channel.ActiveSpeakers[user.ID] = types.SpeakerState{IsTalking: true}
+	channel.ActiveSpeakers[user.ID] = types.SpeakerState{
+		UserID:    user.ID,
+		Username:  user.Username,
+		IsTalking: true,
+		StartTime: time.Now(),
+	}
 
 	event.ChannelID = user.Channel
 	event.Data = map[string]interface{}{
