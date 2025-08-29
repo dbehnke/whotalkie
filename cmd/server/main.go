@@ -329,11 +329,14 @@ func handlePTTStart(event *types.PTTEvent) {
 		return
 	}
 
-	// If this user is NOT publish-only, check if any publish-only users are in the channel
+	// BROADCAST MODE: When publish-only clients (streaming bots) are present,
+	// normal users become listen-only to maintain broadcast/monitoring paradigm.
+	// This enables use cases like live radio, security monitoring, conference playback.
+	// See README.md "Channel Behavior & Broadcast Mode" for full documentation.
 	if !user.PublishOnly {
 		for _, u := range channel.Users {
 			if u.PublishOnly {
-				log.Printf("PTT blocked for user %s in channel %s because publish-only user %s is present", user.Username, channel.ID, u.Username)
+				log.Printf("PTT blocked for user %s in channel %s because publish-only user %s is present (broadcast mode)", user.Username, channel.ID, u.Username)
 				return
 			}
 		}

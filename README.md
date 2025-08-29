@@ -31,6 +31,38 @@ A high-performance, real-time Push-to-Talk (PTT) application built with Go and m
 - **Scalable Design** - Support for multiple channels and users
 - **Real-Time Updates** - Live user presence and channel activity
 
+## 📡 Channel Behavior & Broadcast Mode
+
+WhoTalkie supports two distinct channel operating modes:
+
+### 🎙️ **Normal PTT Mode**
+- All users can transmit and receive audio
+- Standard push-to-talk functionality
+- Multiple users can take turns speaking
+
+### 📻 **Broadcast Mode** (Publish-Only Channels)
+- **Streaming bots/sources** join as "publish-only" clients
+- **Normal users** become **listen-only** when publish-only clients are present
+- **Design Intent**: Enables monitoring/broadcast scenarios
+
+**Use Cases for Broadcast Mode:**
+- **Live Radio Streaming**: Radio stations broadcasting to listeners
+- **Security Monitoring**: Audio feeds from surveillance systems
+- **Conference Recording**: Playback of recorded meetings
+- **Alert Systems**: Emergency broadcasts or notifications
+- **External Audio Monitoring**: Any one-way audio distribution
+
+**Technical Behavior:**
+```bash
+# Publish-only streaming bot joins channel
+./whotalkie-stream -channel "radio" -alias "Live Radio"
+
+# Normal users joining this channel can only listen
+# Their PTT buttons become disabled while the bot is streaming
+```
+
+**Note for Developers:** This behavior is intentional. Normal users are blocked from PTT when publish-only clients are present to maintain the broadcast/monitoring paradigm where the streaming source "owns" the channel.
+
 ## 🚀 Quick Start
 
 ### Prerequisites
