@@ -278,12 +278,14 @@
 </head>
 <body>
     <div class="container">
-        <div class="header">
+        <header class="header" role="banner">
             <h1>WhoTalkie PTT Dashboard</h1>
             <p>Push-to-Talk Communication Server</p>
-        </div>
+        </header>
         
-        <div class="status">
+        <main role="main" aria-label="PTT Dashboard Main Content">
+        
+        <section class="status" aria-label="Server Statistics">
             <div class="status-item">
                 <div class="status-value" id="server-status">Online</div>
                 <div class="status-label">Server Status</div>
@@ -300,9 +302,9 @@
                 <div class="status-value" id="total-clients">0</div>
                 <div class="status-label">Total Clients</div>
             </div>
-        </div>
+        </section>
 
-        <div class="ptt-controls">
+        <section class="ptt-controls" aria-label="Push-to-Talk Controls">
             <div class="connection-info">
                 <div class="status-indicator" id="connection-status"></div>
                 <span id="connection-text">Disconnected</span>
@@ -347,10 +349,12 @@
                 </div>
             </div>
             
-            <div>
-                <input type="text" id="channel-input" class="channel-input" placeholder="Enter channel name (e.g., 'general', 'team1')" />
-                <button onclick="joinChannel()" class="join-button">Join Channel</button>
-                <button onclick="leaveChannel()" class="leave-button">Leave Channel</button>
+            <div role="group" aria-label="Channel Management">
+                <input type="text" id="channel-input" class="channel-input" 
+                       placeholder="Enter channel name (e.g., 'general', 'team1')" 
+                       aria-label="Channel name input" />
+                <button onclick="joinChannel()" class="join-button" aria-label="Join the specified channel">Join Channel</button>
+                <button onclick="leaveChannel()" class="leave-button" aria-label="Leave current channel">Leave Channel</button>
             </div>
             
             <!-- Browser Compatibility Warning (hidden by default, shown by JS if needed) -->
@@ -368,7 +372,9 @@
             
             <button id="ptt-button" class="ptt-button" disabled 
                     onmousedown="startPTT()" onmouseup="endPTT()" 
-                    ontouchstart="startPTT()" ontouchend="endPTT()">
+                    ontouchstart="startPTT()" ontouchend="endPTT()"
+                    aria-label="Push to Talk - Hold to transmit audio"
+                    role="button">
                 HOLD TO TALK
             </button>
             <div style="text-align: center; font-size: 12px; color: #666;">
@@ -376,25 +382,27 @@
             </div>
         </div>
 
-        <div class="channels-section">
+        <section class="channels-section" aria-label="Channels and Users">
             <div class="channels-panel">
-                <div class="panel-title">Active Channels</div>
-                <div id="channel-grid" class="channel-grid">
+                <h2 class="panel-title">Active Channels</h2>
+                <div id="channel-grid" class="channel-grid" role="group" aria-label="Available channels">
                     <div style="color: #999; text-align: center; padding: 20px;">No active channels</div>
                 </div>
             </div>
             <div class="users-panel">
-                <div class="panel-title">Connected Users</div>
-                <div id="users-list" class="user-list">
+                <h2 class="panel-title">Connected Users</h2>
+                <div id="users-list" class="user-list" role="group" aria-label="Connected users">
                     <div style="color: #999; text-align: center; padding: 20px;">No connected users</div>
                 </div>
             </div>
-        </div>
+        </section>
 
-        <div class="ptt-controls">
+        <section class="ptt-controls" aria-label="Activity Log">
             <h3>Activity Log</h3>
-            <div id="messages"></div>
-        </div>
+            <div id="messages" role="log" aria-live="polite" aria-label="Real-time activity messages"></div>
+        </section>
+        
+        </main>
     </div>
 
     <script src="/static/dashboard.js"></script>
