@@ -83,8 +83,6 @@ function stopTransmissionStats() {
     // Keep stats running if receiving, otherwise continue with periodic updates
     if (!audioStats.receiving && statsUpdateInterval) {
         // Don't clear interval - keep stats always updating for persistent display
-        // clearInterval(statsUpdateInterval);
-        // statsUpdateInterval = null;
     }
 }
 
