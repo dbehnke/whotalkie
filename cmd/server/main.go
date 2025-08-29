@@ -325,12 +325,7 @@ func handlePTTStart(event *types.PTTEvent) {
 	if channel.ActiveSpeakers == nil {
 		channel.ActiveSpeakers = make(map[string]types.SpeakerState)
 	}
-	channel.ActiveSpeakers[user.ID] = types.SpeakerState{
-		UserID:    user.ID,
-		Username:  user.Username,
-		StartTime: time.Now(),
-		IsTalking: true,
-	}
+	channel.ActiveSpeakers[user.ID] = types.SpeakerState{IsTalking: true}
 
 	event.ChannelID = user.Channel
 	event.Data = map[string]interface{}{
