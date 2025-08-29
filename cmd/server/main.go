@@ -29,7 +29,11 @@ func handleWebSocket(c *gin.Context) {
 		log.Printf("Failed to upgrade connection: %v", err)
 		return
 	}
-	defer conn.Close(websocket.StatusNormalClosure, "")
+	defer func() {
+		if err := conn.Close(websocket.StatusNormalClosure, ""); err != nil {
+			log.Printf("Error closing WebSocket connection: %v", err)
+		}
+	}()
 
 	userID := uuid.New().String()
 	username := fmt.Sprintf("User_%s", userID[:8])
