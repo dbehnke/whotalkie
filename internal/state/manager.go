@@ -1,6 +1,8 @@
 package state
 
 import (
+	"context"
+	"log"
 	"sort"
 	"sync"
 	"time"
@@ -221,9 +223,34 @@ func (m *Manager) removeUserFromChannel(userID, channelID string) error {
 }
 
 func (m *Manager) BroadcastEvent(event *types.PTTEvent) {
-	select {
-	case m.events <- event:
-	default:
+	// Critical events (PTT, user join/leave) should be blocking to ensure delivery
+	isCritical := event.Type == string(types.EventPTTStart) || 
+				 event.Type == string(types.EventPTTEnd) ||
+				 event.Type == string(types.EventUserJoin) ||
+				 event.Type == string(types.EventUserLeave) ||
+				 event.Type == string(types.EventChannelJoin) ||
+				 event.Type == string(types.EventChannelLeave)
+	
+	if isCritical {
+		// Use context with timeout for critical events to avoid deadlocks
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		
+		select {
+		case m.events <- event:
+			// Event delivered successfully
+		case <-ctx.Done():
+			// Log dropped critical event - this should be monitored
+			log.Printf("WARNING: Critical event dropped due to timeout: %s from user %s", 
+				event.Type, event.UserID)
+		}
+	} else {
+		// Non-critical events use non-blocking approach
+		select {
+		case m.events <- event:
+		default:
+			// Silent drop for non-critical events (heartbeat, etc.)
+		}
 	}
 }
 
