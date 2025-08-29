@@ -131,22 +131,15 @@ function updateStatsDisplay() {
     if (audioStats.transmitting) {
         audioStats.transmissionDuration = (now - audioStats.transmissionStartTime) / 1000;
         
-        // Simple TX bitrate calculation with last-valid-value fallback
-        let calculatedTxBitrate = 0;
-        if (audioStats.transmissionDuration > 0.1 && audioStats.transmittedBytes > 0) {
-            calculatedTxBitrate = (audioStats.transmittedBytes * 8) / (audioStats.transmissionDuration * 1000);
-            
-            // If result is valid, use it and store as last valid value
-            if (isFinite(calculatedTxBitrate) && calculatedTxBitrate >= 0) {
-                audioStats.lastValidTxBitrate = calculatedTxBitrate;
-                audioStats.currentTransmitBitrate = calculatedTxBitrate;
-            } else {
-                // Use last valid value if current calculation is invalid
-                audioStats.currentTransmitBitrate = audioStats.lastValidTxBitrate;
-            }
-        } else {
-            // Use last valid value when no data yet
-            audioStats.currentTransmitBitrate = audioStats.lastValidTxBitrate;
+        // Calculate TX bitrate using extracted validation functions
+        const txDuration = audioStats.transmissionDuration;
+        const txBytes = audioStats.transmittedBytes;
+        
+        audioStats.currentTransmitBitrate = calculateSafeBitrate(txDuration, txBytes, audioStats.lastValidTxBitrate);
+        
+        // Store as last valid value if current calculation succeeded
+        if (isValidReceptionState(txDuration, txBytes) && audioStats.currentTransmitBitrate > 0) {
+            audioStats.lastValidTxBitrate = audioStats.currentTransmitBitrate;
         }
         
         // Simple TX display updates using last valid values
@@ -207,11 +200,14 @@ function calculateSafeBitrate(duration, bytes, lastValidBitrate) {
     
     const calculatedBitrate = (bytes * 8) / (duration * 1000);
     
-    if (isFinite(calculatedBitrate) && calculatedBitrate >= 0) {
-        return calculatedBitrate;
+    return getValidBitrate(calculatedBitrate, lastValidBitrate);
+}
+
+function getValidBitrate(calculated, lastValid) {
+    if (isFinite(calculated) && calculated >= 0) {
+        return calculated;
     }
-    
-    return lastValidBitrate || 0;
+    return lastValid || 0;
 }
 
 function formatBytes(bytes) {
@@ -570,7 +566,6 @@ async function playDecodedAudio(audioData) {
 
         // Important: close AudioData to free memory
         audioData.close();
-        audioData = null; // Mark as cleaned up
         
     } catch (error) {
         addMessage(`❌ Error playing decoded audio: ${error.message}`);

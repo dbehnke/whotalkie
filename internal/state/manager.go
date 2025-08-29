@@ -236,9 +236,21 @@ func (m *Manager) removeUserFromChannel(userID, channelID string) error {
 }
 
 func (m *Manager) BroadcastEvent(event *types.PTTEvent) {
-	// Use the IsCritical method for cleaner event type checking
+	// Validate event type before conversion to prevent issues with invalid event types
 	eventType := types.PTTEventType(event.Type)
-	isCritical := eventType.IsCritical()
+	isCritical := false
+	
+	// Only check criticality for known event types to prevent panics
+	switch eventType {
+	case types.EventPTTStart, types.EventPTTEnd, types.EventUserJoin, 
+		 types.EventUserLeave, types.EventChannelJoin, types.EventChannelLeave,
+		 types.EventAudioData, types.EventHeartbeat:
+		isCritical = eventType.IsCritical()
+	default:
+		// Unknown event type - treat as non-critical for safety
+		log.Printf("WARNING: Unknown event type received: %s", event.Type)
+		isCritical = false
+	}
 	
 	if isCritical {
 		// Use context with timeout for critical events to avoid deadlocks
