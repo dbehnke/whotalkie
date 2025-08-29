@@ -139,6 +139,24 @@ func handleAudioData(wsConn *types.WebSocketConnection, metadata *types.PTTEvent
 	user, exists := stateManager.GetUser(wsConn.UserID)
 	if !exists || user.Channel == "" {
 		log.Printf("Audio data from user %s but no active channel", wsConn.UserID)
+		// Send error feedback to client
+		errorEvent := &types.PTTEvent{
+			Type:      "error",
+			UserID:    wsConn.UserID,
+			Timestamp: time.Now(),
+			Data: map[string]interface{}{
+				"message": "No active channel for audio transmission",
+				"code":    "NO_CHANNEL",
+			},
+		}
+		if client, exists := stateManager.GetClient(wsConn.UserID); exists {
+			if eventBytes, err := json.Marshal(errorEvent); err == nil {
+				select {
+				case client.Send <- eventBytes:
+				default:
+				}
+			}
+		}
 		return
 	}
 

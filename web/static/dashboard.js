@@ -956,6 +956,18 @@ function handleServerEvent(event) {
         case 'heartbeat':
             // Silent heartbeat response
             break;
+            
+        case 'error':
+            // Handle server-side errors with user-friendly messages
+            const errorMsg = event.data.message || 'Unknown server error';
+            const errorCode = event.data.code || 'UNKNOWN';
+            addMessage(`❌ Server Error [${errorCode}]: ${errorMsg}`);
+            
+            // Handle specific error types
+            if (errorCode === 'NO_CHANNEL') {
+                addMessage('💡 Please join a channel before transmitting audio');
+            }
+            break;
     }
 }
 
