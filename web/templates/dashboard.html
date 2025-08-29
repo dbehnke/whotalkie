@@ -274,7 +274,6 @@
             background: #d32f2f;
         }
     </style>
-    <!-- WebCodecs Opus Support: Chrome 94+, Edge 94+, Firefox 106+. Safari not supported. -->
 </head>
 <body>
     <div class="container">
@@ -357,7 +356,20 @@
                 <button onclick="leaveChannel()" class="leave-button" aria-label="Leave current channel">Leave Channel</button>
             </div>
             
-            <!-- Browser Compatibility Warning (hidden by default, shown by JS if needed) -->
+            <!-- Browser Compatibility Section -->
+            <div id="compatibility-info" style="margin: 10px 0; padding: 12px; background: #e8f5e8; border: 1px solid #c3e6c3; border-radius: 4px;">
+                <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 6px;">
+                    <div style="font-size: 16px;">🌐</div>
+                    <div style="font-weight: bold; color: #2d5a2d; font-size: 14px;">Browser Compatibility</div>
+                </div>
+                <div style="font-size: 12px; color: #2d5a2d; line-height: 1.4;">
+                    <div><strong>✅ Supported:</strong> Chrome 94+, Edge 94+, Firefox 106+</div>
+                    <div><strong>❌ Not Supported:</strong> Safari, older browsers</div>
+                    <div style="margin-top: 4px; font-style: italic;">WebCodecs API required for optimal audio quality</div>
+                </div>
+            </div>
+            
+            <!-- Dynamic Compatibility Warning (shown by JS if WebCodecs unavailable) -->
             <div id="compatibility-warning" style="display: none; margin: 10px 0; padding: 15px; background: #fff3cd; border: 1px solid #ffeaa7; border-radius: 4px; text-align: center;">
                 <div style="font-weight: bold; color: #856404; margin-bottom: 5px;">⚠️ Browser Compatibility Issue</div>
                 <div style="font-size: 12px; color: #856404;">
