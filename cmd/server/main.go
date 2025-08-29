@@ -27,6 +27,21 @@ const (
 	MaxAudioChunkSize = 1024 * 1024 // 1MB limit for audio chunks to prevent memory exhaustion
 )
 
+// sendMessageToClient sends a JSON message to a specific client with error handling
+func sendMessageToClient(userID string, message interface{}) {
+	if client, exists := stateManager.GetClient(userID); exists {
+		if messageBytes, err := json.Marshal(message); err == nil {
+			select {
+			case client.Send <- messageBytes:
+			default:
+				log.Printf("Send buffer full for user %s, message dropped", userID)
+			}
+		} else {
+			log.Printf("Failed to marshal message for user %s: %v", userID, err)
+		}
+	}
+}
+
 // isValidChannelName validates channel names to prevent injection attacks
 func isValidChannelName(channelName string) bool {
 	// Security: Channel name validation to prevent injection attacks
@@ -232,14 +247,7 @@ func handleAudioData(wsConn *types.WebSocketConnection, metadata *types.PTTEvent
 				"code":    "NO_CHANNEL",
 			},
 		}
-		if client, exists := stateManager.GetClient(wsConn.UserID); exists {
-			if eventBytes, err := json.Marshal(errorEvent); err == nil {
-				select {
-				case client.Send <- eventBytes:
-				default:
-				}
-			}
-		}
+		sendMessageToClient(wsConn.UserID, errorEvent)
 		return
 	}
 
@@ -483,14 +491,7 @@ func handleHeartbeat(event *types.PTTEvent) {
 		},
 	}
 	
-	if client, exists := stateManager.GetClient(event.UserID); exists {
-		if responseBytes, err := json.Marshal(response); err == nil {
-			select {
-			case client.Send <- responseBytes:
-			default:
-			}
-		}
-	}
+	sendMessageToClient(event.UserID, response)
 }
 
 func broadcastEvents(ctx context.Context) {

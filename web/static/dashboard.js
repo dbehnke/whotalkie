@@ -34,6 +34,14 @@ const MIN_RECEPTION_DURATION = 0.1; // Minimum duration (seconds) for valid audi
 // Logging configuration
 const AUDIO_CHUNK_LOG_SAMPLE_RATE = 0.05; // Sample rate for audio chunk logging (5% to reduce noise)
 let webCodecsSupported = false;
+
+// Helper function to update DOM elements safely
+function updateElementText(elementId, text) {
+    const element = document.getElementById(elementId);
+    if (element) {
+        element.textContent = text;
+    }
+}
 let audioTimestamp = 0; // Track continuous timestamp
 
 // Audio statistics tracking
@@ -157,9 +165,9 @@ function updateStatsDisplay() {
         const safeTxDuration = isFinite(audioStats.transmissionDuration) ? audioStats.transmissionDuration.toFixed(1) : '0.0';
         const safeTxBitrate = isFinite(audioStats.currentTransmitBitrate) ? audioStats.currentTransmitBitrate.toFixed(1) : '0.0';
         
-        document.getElementById('tx-duration').textContent = safeTxDuration + 's';
-        document.getElementById('tx-bytes').textContent = formatBytes(audioStats.transmittedBytes || 0);
-        document.getElementById('tx-bitrate').textContent = safeTxBitrate + ' kbps';
+        updateElementText('tx-duration', safeTxDuration + 's');
+        updateElementText('tx-bytes', formatBytes(audioStats.transmittedBytes || 0));
+        updateElementText('tx-bitrate', safeTxBitrate + ' kbps');
     }
     
     if (audioStats.receiving) {
@@ -172,7 +180,7 @@ function updateStatsDisplay() {
         // Early validation to prevent any invalid calculations
         if (!audioStats.receptionStartTime || audioStats.receptionStartTime <= 0 || now <= audioStats.receptionStartTime) {
             // Invalid start time, skip calculation
-            document.getElementById('rx-bitrate').textContent = '0.0 kbps';
+            updateElementText('rx-bitrate', '0.0 kbps');
             return;
         }
         
@@ -193,10 +201,10 @@ function updateStatsDisplay() {
         const safeDuration = isFinite(audioStats.receptionDuration) ? audioStats.receptionDuration.toFixed(1) : '0.0';
         const safeBitrate = isFinite(audioStats.currentReceiveBitrate) ? audioStats.currentReceiveBitrate.toFixed(1) : '0.0';
         
-        document.getElementById('rx-duration').textContent = safeDuration + 's';
-        document.getElementById('rx-bytes').textContent = formatBytes(audioStats.receivedBytes || 0);
-        document.getElementById('rx-bitrate').textContent = safeBitrate + ' kbps';
-        document.getElementById('rx-source').textContent = audioStats.currentReceivingSource || 'Unknown';
+        updateElementText('rx-duration', safeDuration + 's');
+        updateElementText('rx-bytes', formatBytes(audioStats.receivedBytes || 0));
+        updateElementText('rx-bitrate', safeBitrate + ' kbps');
+        updateElementText('rx-source', audioStats.currentReceivingSource || 'Unknown');
     }
 }
 
@@ -570,10 +578,10 @@ async function playDecodedAudio(audioData) {
         // Update audio stats with more detailed info
         if (audioData.duration > 0) {
             const bitrate = (audioData.byteLength * 8) / (audioData.duration / 1000000) / 1000;
-            document.getElementById('rx-bitrate').textContent = `${bitrate.toFixed(1)} kbps`;
+            updateElementText('rx-bitrate', `${bitrate.toFixed(1)} kbps`);
         }
         const channelText = numberOfChannels === 1 ? 'Mono' : `${numberOfChannels}-channel`;
-        document.getElementById('rx-channels').textContent = `${channelText} @ ${sampleRate}Hz`;
+        updateElementText('rx-channels', `${channelText} @ ${sampleRate}Hz`);
 
         // Important: close AudioData to free memory
         audioData.close();
@@ -1085,9 +1093,9 @@ function updateStats() {
     fetch('/api/stats')
         .then(response => response.json())
         .then(stats => {
-            document.getElementById('active-channels').textContent = stats.active_channels;
-            document.getElementById('connected-users').textContent = stats.active_users;
-            document.getElementById('total-clients').textContent = stats.connected_clients;
+            updateElementText('active-channels', stats.active_channels);
+            updateElementText('connected-users', stats.active_users);
+            updateElementText('total-clients', stats.connected_clients);
         })
         .catch(err => console.error('Failed to fetch stats:', err));
 }
