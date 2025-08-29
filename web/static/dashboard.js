@@ -19,6 +19,8 @@ let webCodecsEncoder = null;
 let webCodecsDecoder = null;
 const OPUS_SAMPLE_RATE = 48000;
 const OPUS_BITRATE = 32000;
+const BUFFER_MAX_SIZE = 10; // Maximum buffer size to prevent memory issues
+const BUFFER_TARGET_SIZE = 3; // Target buffer size for smooth playback
 let webCodecsSupported = false;
 let audioTimestamp = 0; // Track continuous timestamp
 
@@ -916,6 +918,8 @@ function handleServerEvent(event) {
             addMessage(`🎙️ ${event.data.username} started talking in ${event.channel_id}`);
             highlightTalkingUser(event.user_id, true);
             highlightTalkingChannel(event.channel_id, true);
+            updateChannelsList(); // Refresh channel list to update speaker count
+            updateChannelsList(); // Refresh channel list to update speaker count
             
             // Track active speakers
             audioStats.activeSpeakers.set(event.user_id, {
@@ -936,6 +940,7 @@ function handleServerEvent(event) {
             addMessage(`🔇 ${event.data.username} stopped talking in ${event.channel_id}`);
             highlightTalkingUser(event.user_id, false);
             highlightTalkingChannel(event.channel_id, false);
+            updateChannelsList(); // Refresh channel list to update speaker count
             
             // Remove from active speakers
             audioStats.activeSpeakers.delete(event.user_id);
