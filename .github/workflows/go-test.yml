@@ -15,7 +15,12 @@ jobs:
     env:
       RUN_LINT: 'true'
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Fetch full history so tooling that reads VCS metadata (build stamping)
+          # can run inside the dockerized linter without failing with "error obtaining VCS status".
+          fetch-depth: 0
 
       - name: Set up Go
         uses: actions/setup-go@v4
