@@ -22,7 +22,36 @@ import (
 	"whotalkie/internal/types"
 )
 
-var stateManager *state.Manager
+// Server represents the WhoTalkie server with all its dependencies
+type Server struct {
+	stateManager *state.Manager
+	router       *gin.Engine
+	httpServer   *http.Server
+	ctx          context.Context
+	cancel       context.CancelFunc
+}
+
+// NewServer creates a new server instance with proper dependency injection
+func NewServer() *Server {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	return &Server{
+		stateManager: state.NewManager(),
+		ctx:          ctx,
+		cancel:       cancel,
+	}
+}
+
+// NewServerWithOptions creates a server with custom options
+func NewServerWithOptions(bufferSize int) *Server {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	return &Server{
+		stateManager: state.NewManagerWithBufferSize(bufferSize),
+		ctx:          ctx,
+		cancel:       cancel,
+	}
+}
 
 // Security and performance constants
 const (
@@ -103,7 +132,7 @@ func validateChunkSize(eventData map[string]interface{}, userID string) (int64, 
 }
 
 // sendMessageToClient sends a JSON message to a specific client with error handling
-func sendMessageToClient(userID string, message interface{}) {
+func sendMessageToClient(stateManager *state.Manager, userID string, message interface{}) {
 	if client, exists := stateManager.GetClient(userID); exists {
 		if messageBytes, err := json.Marshal(message); err == nil {
 			select {
@@ -216,7 +245,7 @@ func isValidUsername(username string) bool {
 	return true
 }
 
-func handleWebSocket(c *gin.Context) {
+func (s *Server) handleWebSocket(c *gin.Context) {
 	conn, err := websocket.Accept(c.Writer, c.Request, &websocket.AcceptOptions{
 		// Security: Restrict origins to localhost for development
 		// TODO: Configure proper origins for production deployment
@@ -226,11 +255,10 @@ func handleWebSocket(c *gin.Context) {
 		log.Printf("Failed to upgrade connection: %v", err)
 		return
 	}
-	defer func() {
-		if err := conn.Close(websocket.StatusNormalClosure, ""); err != nil {
-			log.Printf("Error closing WebSocket connection: %v", err)
-		}
-	}()
+
+	// Create context for connection lifecycle management
+	ctx, cancel := context.WithCancel(c.Request.Context())
+	defer cancel()
 
 	userID := uuid.New().String()
 	username := fmt.Sprintf("User_%s", userID[:8])
@@ -248,59 +276,196 @@ func handleWebSocket(c *gin.Context) {
 		Send:   make(chan []byte, 256),
 	}
 
-	stateManager.AddUser(user)
-	stateManager.AddClient(userID, wsConn)
+	// Enhanced connection lifecycle management
+	connectionManager := &ConnectionManager{
+		conn:         conn,
+		wsConn:       wsConn,
+		user:         user,
+		ctx:          ctx,
+		cancel:       cancel,
+		userID:       userID,
+		username:     username,
+		stateManager: s.stateManager,
+	}
 
-	log.Printf("New WebSocket connection: User %s (%s)", username, userID)
+	connectionManager.initialize()
+	defer connectionManager.cleanup()
 
-	stateManager.BroadcastEvent(&types.PTTEvent{
+	// Start goroutines with proper context
+	go connectionManager.handleClientWrite()
+
+	// Main read loop with enhanced error handling
+	connectionManager.handleClientRead()
+}
+
+// ConnectionManager manages the lifecycle of a WebSocket connection
+type ConnectionManager struct {
+	conn         *websocket.Conn
+	wsConn       *types.WebSocketConnection
+	user         *types.User
+	ctx          context.Context
+	cancel       context.CancelFunc
+	userID       string
+	username     string
+	stateManager *state.Manager
+}
+
+func (cm *ConnectionManager) initialize() {
+	cm.stateManager.AddUser(cm.user)
+	cm.stateManager.AddClient(cm.userID, cm.wsConn)
+
+	log.Printf("New WebSocket connection: User %s (%s)", cm.username, cm.userID)
+
+	cm.stateManager.BroadcastEvent(&types.PTTEvent{
 		Type:      string(types.EventUserJoin),
-		UserID:    userID,
+		UserID:    cm.userID,
 		ChannelID: "",
 		Timestamp: time.Now(),
 		Data: map[string]interface{}{
-			"username": username,
+			"username": cm.username,
+		},
+	})
+}
+
+func (cm *ConnectionManager) cleanup() {
+	// Cancel context to stop all associated goroutines
+	cm.cancel()
+
+	// Close WebSocket connection
+	closeStatus := websocket.StatusNormalClosure
+	closeReason := ""
+
+	// Check if context was cancelled due to error
+	if err := cm.ctx.Err(); err != nil && err != context.Canceled {
+		closeStatus = websocket.StatusInternalError
+		closeReason = "Internal error"
+	}
+
+	if err := cm.conn.Close(closeStatus, closeReason); err != nil {
+		log.Printf("Error closing WebSocket connection for user %s: %v", cm.userID, err)
+	}
+
+	// Clean up state
+	cm.stateManager.RemoveUser(cm.userID)
+	cm.stateManager.RemoveClient(cm.userID)
+
+	// Broadcast leave event
+	cm.stateManager.BroadcastEvent(&types.PTTEvent{
+		Type:      string(types.EventUserLeave),
+		UserID:    cm.userID,
+		ChannelID: cm.user.Channel,
+		Timestamp: time.Now(),
+		Data: map[string]interface{}{
+			"username": cm.username,
+			"reason":   "disconnect",
 		},
 	})
 
-	go handleClientWrite(wsConn)
-
-	defer func() {
-		stateManager.RemoveUser(userID)
-		stateManager.RemoveClient(userID)
-
-		stateManager.BroadcastEvent(&types.PTTEvent{
-			Type:      string(types.EventUserLeave),
-			UserID:    userID,
-			ChannelID: user.Channel,
-			Timestamp: time.Now(),
-			Data: map[string]interface{}{
-				"username": username,
-			},
-		})
-
-		log.Printf("User %s (%s) disconnected", username, userID)
-	}()
-
-	handleClientRead(wsConn)
+	log.Printf("User %s (%s) disconnected", cm.username, cm.userID)
 }
 
-// handleTextMessage processes text messages from WebSocket
-func handleTextMessage(message []byte, wsConn *types.WebSocketConnection, expectingAudioData *bool, audioMetadata **types.PTTEvent) {
+func (cm *ConnectionManager) handleClientWrite() {
+	for {
+		select {
+		case <-cm.ctx.Done():
+			return
+		case message, ok := <-cm.wsConn.Send:
+			if !ok {
+				return // Channel closed
+			}
+
+			// Determine message type by trying to parse as JSON
+			var messageType websocket.MessageType
+			var event types.PTTEvent
+			if err := json.Unmarshal(message, &event); err == nil {
+				// It's JSON, send as text
+				messageType = websocket.MessageText
+			} else {
+				// It's binary data, send as binary
+				messageType = websocket.MessageBinary
+			}
+
+			// Use context with timeout for write operations
+			writeCtx, cancel := context.WithTimeout(cm.ctx, 10*time.Second)
+			err := cm.conn.Write(writeCtx, messageType, message)
+			cancel()
+
+			if err != nil {
+				log.Printf("WebSocket write error for user %s: %v", cm.userID, err)
+				cm.cancel() // Trigger cleanup
+				return
+			}
+		}
+	}
+}
+
+func (cm *ConnectionManager) handleClientRead() {
+	var expectingAudioData bool
+	var audioMetadata *types.PTTEvent
+
+	for {
+		select {
+		case <-cm.ctx.Done():
+			return
+		default:
+			// Set read timeout
+			readCtx, cancel := context.WithTimeout(cm.ctx, 30*time.Second)
+			msgType, message, err := cm.wsConn.Conn.Read(readCtx)
+			cancel()
+
+			if err != nil {
+				// Check if it's a normal close
+				if websocket.CloseStatus(err) == websocket.StatusNormalClosure {
+					log.Printf("WebSocket normal close for user %s", cm.userID)
+				} else {
+					log.Printf("WebSocket read error for user %s: %v", cm.userID, err)
+				}
+				cm.cancel() // Trigger cleanup
+				return
+			}
+
+			switch msgType {
+			case websocket.MessageText:
+				cm.handleTextMessage(message, &expectingAudioData, &audioMetadata)
+			case websocket.MessageBinary:
+				cm.handleBinaryMessage(message, &expectingAudioData, &audioMetadata)
+			}
+		}
+	}
+}
+
+func (cm *ConnectionManager) handleTextMessage(message []byte, expectingAudioData *bool, audioMetadata **types.PTTEvent) {
 	var event types.PTTEvent
 	if err := json.Unmarshal(message, &event); err != nil {
-		log.Printf("Failed to parse message from user %s: %v", wsConn.UserID, err)
+		log.Printf("Failed to parse message from user %s: %v", cm.userID, err)
 		return
 	}
 
-	event.UserID = wsConn.UserID
+	event.UserID = cm.userID
 	event.Timestamp = time.Now()
 
 	// Check if this is audio metadata
 	if event.Type == string(types.EventAudioData) {
-		handleAudioMetadata(&event, wsConn, expectingAudioData, audioMetadata)
+		handleAudioMetadata(&event, cm.wsConn, expectingAudioData, audioMetadata)
 	} else {
-		handleEvent(&event)
+		handleEvent(cm.stateManager, &event)
+	}
+}
+
+func (cm *ConnectionManager) handleBinaryMessage(message []byte, expectingAudioData *bool, audioMetadata **types.PTTEvent) {
+	// Security: Limit binary message size to prevent memory exhaustion
+	if len(message) > MaxAudioChunkSize {
+		log.Printf("SECURITY: Rejecting oversized binary message from user %s: %d bytes", cm.userID, len(message))
+		return
+	}
+
+	// Handle binary audio data
+	if *expectingAudioData && *audioMetadata != nil {
+		handleAudioData(cm.stateManager, cm.wsConn, *audioMetadata, message)
+		*expectingAudioData = false
+		*audioMetadata = nil
+	} else {
+		log.Printf("Received unexpected binary data from user %s", cm.userID)
 	}
 }
 
@@ -322,46 +487,9 @@ func handleAudioMetadata(event *types.PTTEvent, wsConn *types.WebSocketConnectio
 }
 
 // handleBinaryMessage processes binary messages from WebSocket
-func handleBinaryMessage(message []byte, wsConn *types.WebSocketConnection, expectingAudioData *bool, audioMetadata **types.PTTEvent) {
-	// Security: Limit binary message size to prevent memory exhaustion
-	if len(message) > MaxAudioChunkSize {
-		log.Printf("SECURITY: Rejecting oversized binary message from user %s: %d bytes", wsConn.UserID, len(message))
-		return
-	}
-
-	// Handle binary audio data
-	if *expectingAudioData && *audioMetadata != nil {
-		handleAudioData(wsConn, *audioMetadata, message)
-		*expectingAudioData = false
-		*audioMetadata = nil
-	} else {
-		log.Printf("Received unexpected binary data from user %s", wsConn.UserID)
-	}
-}
-
-func handleClientRead(wsConn *types.WebSocketConnection) {
-	ctx := context.Background()
-	var expectingAudioData bool
-	var audioMetadata *types.PTTEvent
-
-	for {
-		msgType, message, err := wsConn.Conn.Read(ctx)
-		if err != nil {
-			log.Printf("WebSocket read error for user %s: %v", wsConn.UserID, err)
-			break
-		}
-
-		switch msgType {
-		case websocket.MessageText:
-			handleTextMessage(message, wsConn, &expectingAudioData, &audioMetadata)
-		case websocket.MessageBinary:
-			handleBinaryMessage(message, wsConn, &expectingAudioData, &audioMetadata)
-		}
-	}
-}
 
 // sendErrorToClient sends an error event to a client
-func sendErrorToClient(userID string, message string, code string) {
+func sendErrorToClient(stateManager *state.Manager, userID string, message string, code string) {
 	errorEvent := &types.PTTEvent{
 		Type:      "error",
 		UserID:    userID,
@@ -371,15 +499,15 @@ func sendErrorToClient(userID string, message string, code string) {
 			"code":    code,
 		},
 	}
-	sendMessageToClient(userID, errorEvent)
+	sendMessageToClient(stateManager, userID, errorEvent)
 }
 
 // validateUserForAudio validates if user can send audio
-func validateUserForAudio(wsConn *types.WebSocketConnection) (*types.User, bool) {
+func validateUserForAudio(stateManager *state.Manager, wsConn *types.WebSocketConnection) (*types.User, bool) {
 	user, exists := stateManager.GetUser(wsConn.UserID)
 	if !exists || user.Channel == "" {
 		log.Printf("Audio data from user %s but no active channel", wsConn.UserID)
-		sendErrorToClient(wsConn.UserID, "No active channel for audio transmission", "NO_CHANNEL")
+		sendErrorToClient(stateManager, wsConn.UserID, "No active channel for audio transmission", "NO_CHANNEL")
 		return nil, false
 	}
 	return user, true
@@ -395,7 +523,7 @@ func getAudioFormat(metadata *types.PTTEvent) string {
 }
 
 // broadcastAudioToChannel broadcasts audio data to channel users
-func broadcastAudioToChannel(wsConn *types.WebSocketConnection, metadata *types.PTTEvent, audioData []byte, channel *types.Channel) {
+func broadcastAudioToChannel(stateManager *state.Manager, wsConn *types.WebSocketConnection, metadata *types.PTTEvent, audioData []byte, channel *types.Channel) {
 	for _, channelUser := range channel.Users {
 		if shouldSkipUser(channelUser, wsConn.UserID) {
 			continue
@@ -436,8 +564,8 @@ func sendAudioToClient(client *types.WebSocketConnection, metadata *types.PTTEve
 	}
 }
 
-func handleAudioData(wsConn *types.WebSocketConnection, metadata *types.PTTEvent, audioData []byte) {
-	user, valid := validateUserForAudio(wsConn)
+func handleAudioData(stateManager *state.Manager, wsConn *types.WebSocketConnection, metadata *types.PTTEvent, audioData []byte) {
+	user, valid := validateUserForAudio(stateManager, wsConn)
 	if !valid {
 		return
 	}
@@ -453,51 +581,29 @@ func handleAudioData(wsConn *types.WebSocketConnection, metadata *types.PTTEvent
 		return
 	}
 
-	broadcastAudioToChannel(wsConn, metadata, audioData, channel)
+	broadcastAudioToChannel(stateManager, wsConn, metadata, audioData, channel)
 }
 
-func handleClientWrite(wsConn *types.WebSocketConnection) {
-	ctx := context.Background()
-
-	for message := range wsConn.Send {
-		// Determine message type by trying to parse as JSON
-		var messageType websocket.MessageType
-		var event types.PTTEvent
-		if err := json.Unmarshal(message, &event); err == nil {
-			// It's JSON, send as text
-			messageType = websocket.MessageText
-		} else {
-			// It's binary data, send as binary
-			messageType = websocket.MessageBinary
-		}
-
-		if err := wsConn.Conn.Write(ctx, messageType, message); err != nil {
-			log.Printf("WebSocket write error for user %s: %v", wsConn.UserID, err)
-			return
-		}
-	}
-}
-
-func handleEvent(event *types.PTTEvent) {
+func handleEvent(stateManager *state.Manager, event *types.PTTEvent) {
 	log.Printf("Handling event: %s from user %s", event.Type, event.UserID)
 
 	switch event.Type {
 	case string(types.EventChannelJoin):
-		handleChannelJoin(event)
+		handleChannelJoin(stateManager, event)
 	case string(types.EventChannelLeave):
-		handleChannelLeave(event)
+		handleChannelLeave(stateManager, event)
 	case string(types.EventPTTStart):
-		handlePTTStart(event)
+		handlePTTStart(stateManager, event)
 	case string(types.EventPTTEnd):
-		handlePTTEnd(event)
+		handlePTTEnd(stateManager, event)
 	case string(types.EventHeartbeat):
-		handleHeartbeat(event)
+		handleHeartbeat(stateManager, event)
 	default:
 		log.Printf("Unknown event type: %s", event.Type)
 	}
 }
 
-func handleChannelJoin(event *types.PTTEvent) {
+func handleChannelJoin(stateManager *state.Manager, event *types.PTTEvent) {
 	channelID := event.ChannelID
 	if channelID == "" {
 		if channelName, ok := event.Data["channel_name"].(string); ok {
@@ -552,7 +658,7 @@ func handleChannelJoin(event *types.PTTEvent) {
 	stateManager.BroadcastEvent(event)
 }
 
-func handleChannelLeave(event *types.PTTEvent) {
+func handleChannelLeave(stateManager *state.Manager, event *types.PTTEvent) {
 	if err := stateManager.LeaveChannel(event.UserID, event.ChannelID); err != nil {
 		log.Printf("Failed to leave channel %s: %v", event.ChannelID, err)
 		return
@@ -566,7 +672,7 @@ func handleChannelLeave(event *types.PTTEvent) {
 	stateManager.BroadcastEvent(event)
 }
 
-func handlePTTStart(event *types.PTTEvent) {
+func handlePTTStart(stateManager *state.Manager, event *types.PTTEvent) {
 	user, exists := stateManager.GetUser(event.UserID)
 	if !exists || user.Channel == "" {
 		return
@@ -607,7 +713,7 @@ func handlePTTStart(event *types.PTTEvent) {
 	stateManager.BroadcastEvent(event)
 }
 
-func handlePTTEnd(event *types.PTTEvent) {
+func handlePTTEnd(stateManager *state.Manager, event *types.PTTEvent) {
 	user, exists := stateManager.GetUser(event.UserID)
 	if !exists || user.Channel == "" {
 		return
@@ -627,7 +733,7 @@ func handlePTTEnd(event *types.PTTEvent) {
 	stateManager.BroadcastEvent(event)
 }
 
-func handleHeartbeat(event *types.PTTEvent) {
+func handleHeartbeat(stateManager *state.Manager, event *types.PTTEvent) {
 	user, exists := stateManager.GetUser(event.UserID)
 	if !exists {
 		return
@@ -643,13 +749,17 @@ func handleHeartbeat(event *types.PTTEvent) {
 		},
 	}
 
-	sendMessageToClient(event.UserID, response)
+	sendMessageToClient(stateManager, event.UserID, response)
 }
 
-func broadcastEvents(ctx context.Context) {
+func (s *Server) broadcastEvents() {
+	// Track consecutive failures per client for cleanup
+	clientFailures := make(map[string]int)
+	const maxConsecutiveFailures = 5 // Clean up after 5 consecutive failures
+
 	for {
 		select {
-		case event, ok := <-stateManager.GetEventChannel():
+		case event, ok := <-s.stateManager.GetEventChannel():
 			if !ok {
 				// Channel closed, exit gracefully
 				log.Println("Event channel closed, stopping broadcast goroutine")
@@ -662,106 +772,184 @@ func broadcastEvents(ctx context.Context) {
 				continue
 			}
 
-			clients := stateManager.GetAllClients()
-			for _, client := range clients {
+			clients := s.stateManager.GetAllClients()
+			var clientsToRemove []string
+
+			for userID, client := range clients {
 				select {
 				case client.Send <- eventBytes:
+					// Reset failure count on successful send
+					delete(clientFailures, userID)
 				default:
-					log.Printf("Client %s send channel full, skipping", client.UserID)
+					// Track consecutive failures
+					clientFailures[userID]++
+					failureCount := clientFailures[userID]
+
+					log.Printf("Client %s send channel full (failure %d/%d)",
+						userID, failureCount, maxConsecutiveFailures)
+
+					// Mark for removal if too many failures
+					if failureCount >= maxConsecutiveFailures {
+						clientsToRemove = append(clientsToRemove, userID)
+						log.Printf("Marking client %s for cleanup due to consecutive failures", userID)
+					}
 				}
 			}
-		case <-ctx.Done():
+
+			// Clean up problematic clients outside the iteration
+			for _, userID := range clientsToRemove {
+				go s.cleanupDisconnectedClient(userID)
+				delete(clientFailures, userID)
+			}
+
+		case <-s.ctx.Done():
 			log.Println("Context cancelled, stopping broadcast goroutine")
 			return
 		}
 	}
 }
 
-func main() {
-	stateManager = state.NewManager()
+// cleanupDisconnectedClient removes a client that appears to be disconnected
+func (s *Server) cleanupDisconnectedClient(userID string) {
+	log.Printf("Cleaning up potentially disconnected client: %s", userID)
 
-	// Create context for graceful shutdown
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// Remove from state manager (this will handle channel cleanup too)
+	s.stateManager.RemoveClient(userID)
+	s.stateManager.RemoveUser(userID)
 
-	go broadcastEvents(ctx)
+	// Broadcast user leave event
+	s.stateManager.BroadcastEvent(&types.PTTEvent{
+		Type:      string(types.EventUserLeave),
+		UserID:    userID,
+		Timestamp: time.Now(),
+		Data: map[string]interface{}{
+			"reason": "connection_cleanup",
+		},
+	})
+}
 
-	r := gin.Default()
+// setupRoutes configures all HTTP routes for the server
+func (s *Server) setupRoutes() {
+	s.router = gin.Default()
 
-	r.Static("/static", "./web/static")
-	r.LoadHTMLGlob("web/templates/*")
+	s.router.Static("/static", "./web/static")
+	s.router.LoadHTMLGlob("web/templates/*")
 
-	r.GET("/health", func(c *gin.Context) {
+	s.router.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"status":  "ok",
 			"service": "whotalkie",
 		})
 	})
 
-	r.GET("/", func(c *gin.Context) {
+	s.router.GET("/", func(c *gin.Context) {
 		c.HTML(http.StatusOK, "dashboard.html", gin.H{
 			"title": "WhoTalkie Dashboard",
 		})
 	})
 
-	r.GET("/api", func(c *gin.Context) {
+	s.router.GET("/api", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"message": "WhoTalkie PTT Server",
 			"version": "0.1.0",
 		})
 	})
 
-	r.GET("/api/stats", func(c *gin.Context) {
-		stats := stateManager.GetStats()
-		c.JSON(http.StatusOK, stats)
-	})
+	s.router.GET("/api/stats", s.handleStats)
+	s.router.GET("/api/users", s.handleUsers)
+	s.router.GET("/api/channels", s.handleChannels)
+	s.router.GET("/ws", s.handleWebSocket)
+}
 
-	r.GET("/api/users", func(c *gin.Context) {
-		users := stateManager.GetAllUsers()
-		c.JSON(http.StatusOK, gin.H{"users": users})
-	})
+// Handler methods for the server
+func (s *Server) handleStats(c *gin.Context) {
+	stats := s.stateManager.GetStats()
+	c.JSON(http.StatusOK, stats)
+}
 
-	r.GET("/api/channels", func(c *gin.Context) {
-		channels := stateManager.GetAllChannels()
-		c.JSON(http.StatusOK, gin.H{"channels": channels})
-	})
+func (s *Server) handleUsers(c *gin.Context) {
+	users := s.stateManager.GetAllUsers()
+	c.JSON(http.StatusOK, gin.H{"users": users})
+}
 
-	r.GET("/ws", handleWebSocket)
+func (s *Server) handleChannels(c *gin.Context) {
+	channels := s.stateManager.GetAllChannels()
+	c.JSON(http.StatusOK, gin.H{"channels": channels})
+}
 
-	// Create HTTP server with graceful shutdown
-	server := &http.Server{
+func main() {
+	server := NewServer()
+	defer server.Shutdown()
+
+	// Start background services
+	server.Start()
+
+	// Setup routes
+	server.setupRoutes()
+
+	// Run server
+	if err := server.Run(); err != nil {
+		log.Fatalf("Failed to start server: %v", err)
+	}
+}
+
+// Start begins background services for the server
+func (s *Server) Start() {
+	// Start event broadcasting goroutine
+	go s.broadcastEvents()
+}
+
+// Run starts the HTTP server with graceful shutdown
+func (s *Server) Run() error {
+	// Create HTTP server
+	s.httpServer = &http.Server{
 		Addr:              ":8080",
-		Handler:           r,
+		Handler:           s.router,
 		ReadHeaderTimeout: 30 * time.Second,
 	}
 
-	// Handle graceful shutdown
-	go func() {
-		sigChan := make(chan os.Signal, 1)
-		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-		<-sigChan
-
-		log.Println("🛑 Shutting down server...")
-
-		// Cancel broadcast context first to stop goroutines
-		cancel()
-
-		// Shutdown state manager and close connections
-		stateManager.Shutdown()
-
-		// Give active connections 30 seconds to finish
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer shutdownCancel()
-
-		if err := server.Shutdown(shutdownCtx); err != nil {
-			log.Printf("Server forced to shutdown: %v", err)
-		} else {
-			log.Println("✅ Server shutdown complete")
-		}
-	}()
+	// Handle graceful shutdown in a separate goroutine
+	go s.handleShutdown()
 
 	log.Println("Starting WhoTalkie server on :8080 (Ctrl+C to stop)")
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatal("Failed to start server:", err)
+	if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		return fmt.Errorf("failed to start server: %w", err)
+	}
+
+	return nil
+}
+
+// handleShutdown manages graceful server shutdown
+func (s *Server) handleShutdown() {
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	<-sigChan
+
+	log.Println("🛑 Shutting down server...")
+
+	// Cancel context to stop goroutines
+	s.cancel()
+
+	// Shutdown state manager and close connections
+	s.stateManager.Shutdown()
+
+	// Give active connections 30 seconds to finish
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := s.httpServer.Shutdown(shutdownCtx); err != nil {
+		log.Printf("Server forced to shutdown: %v", err)
+	} else {
+		log.Println("✅ Server shutdown complete")
+	}
+}
+
+// Shutdown gracefully shuts down the server
+func (s *Server) Shutdown() {
+	if s.cancel != nil {
+		s.cancel()
+	}
+	if s.stateManager != nil {
+		s.stateManager.Shutdown()
 	}
 }

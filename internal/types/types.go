@@ -83,4 +83,6 @@ type ServerStats struct {
 	ActiveChannels        int `json:"active_channels"`
 	ConnectedClients      int `json:"connected_clients"`
 	DroppedCriticalEvents int `json:"dropped_critical_events"`
+	EventBufferLength     int `json:"event_buffer_length"`
+	EventBufferCapacity   int `json:"event_buffer_capacity"`
 }

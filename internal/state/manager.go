@@ -16,15 +16,39 @@ type Manager struct {
 	channels              map[string]*types.Channel
 	clients               map[string]*types.WebSocketConnection
 	events                chan *types.PTTEvent
-	droppedCriticalEvents int // Track dropped critical events for monitoring
+	droppedCriticalEvents int  // Track dropped critical events for monitoring
+	isShuttingDown        bool // Flag to prevent race conditions during shutdown
 }
+
+// Event buffer configuration constants
+const (
+	DefaultEventBufferSize = 1000  // Increased from 100 for better throughput
+	MaxEventBufferSize     = 10000 // Maximum buffer size for high-load scenarios
+)
 
 func NewManager() *Manager {
 	return &Manager{
 		users:    make(map[string]*types.User),
 		channels: make(map[string]*types.Channel),
 		clients:  make(map[string]*types.WebSocketConnection),
-		events:   make(chan *types.PTTEvent, 100),
+		events:   make(chan *types.PTTEvent, DefaultEventBufferSize),
+	}
+}
+
+// NewManagerWithBufferSize creates a manager with custom event buffer size
+func NewManagerWithBufferSize(bufferSize int) *Manager {
+	if bufferSize <= 0 {
+		bufferSize = DefaultEventBufferSize
+	}
+	if bufferSize > MaxEventBufferSize {
+		bufferSize = MaxEventBufferSize
+	}
+
+	return &Manager{
+		users:    make(map[string]*types.User),
+		channels: make(map[string]*types.Channel),
+		clients:  make(map[string]*types.WebSocketConnection),
+		events:   make(chan *types.PTTEvent, bufferSize),
 	}
 }
 
@@ -283,6 +307,15 @@ func (m *Manager) removeUserFromChannel(userID, channelID string) error {
 }
 
 func (m *Manager) BroadcastEvent(event *types.PTTEvent) {
+	// Check if we're shutting down first
+	m.mu.RLock()
+	if m.isShuttingDown {
+		m.mu.RUnlock()
+		log.Printf("Discarding event %s during shutdown", event.Type)
+		return
+	}
+	m.mu.RUnlock()
+
 	// Validate event type before conversion to prevent issues with invalid event types
 	eventType := types.PTTEventType(event.Type)
 	isCritical := false
@@ -348,6 +381,10 @@ func (m *Manager) GetStats() types.ServerStats {
 		}
 	}
 
+	// Calculate event buffer utilization
+	eventBufferLen := len(m.events)
+	eventBufferCap := cap(m.events)
+
 	return types.ServerStats{
 		TotalUsers:            len(m.users),
 		ActiveUsers:           activeUsers,
@@ -355,26 +392,39 @@ func (m *Manager) GetStats() types.ServerStats {
 		ActiveChannels:        activeChannels,
 		ConnectedClients:      len(m.clients),
 		DroppedCriticalEvents: m.droppedCriticalEvents,
+		EventBufferLength:     eventBufferLen,
+		EventBufferCapacity:   eventBufferCap,
 	}
 }
 
 // Shutdown gracefully closes the event channel and cleans up resources
 func (m *Manager) Shutdown() {
 	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Check if we're already shutting down to prevent race conditions
+	if m.isShuttingDown {
+		log.Printf("Shutdown already in progress, ignoring duplicate call")
+		return
+	}
+
+	// Set shutdown flag first
+	m.isShuttingDown = true
 
 	// Close event channel to signal broadcast goroutine to stop
 	close(m.events)
 
-	// Snapshot client connections to avoid deadlocks
-	clients := make([]*types.WebSocketConnection, 0, len(m.clients))
-	for _, client := range m.clients {
-		clients = append(clients, client)
-	}
-	m.mu.Unlock()
-
-	// Close all client Send channels outside the lock to avoid deadlocks
-	for _, client := range clients {
-		close(client.Send)
+	// Close all client Send channels safely
+	for userID, client := range m.clients {
+		// Check if channel is already closed by trying a non-blocking send
+		select {
+		case <-client.Send:
+			// Channel is already closed
+		default:
+			// Channel is open, safe to close
+			close(client.Send)
+		}
+		delete(m.clients, userID)
 	}
 
 	log.Printf("State manager shutdown complete")
