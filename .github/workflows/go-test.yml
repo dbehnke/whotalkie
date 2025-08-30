@@ -1,37 +1,4 @@
-name: Go Tests (minimal)
-
-on:
-  push:
-    branches: [ main, 'feature/*' ]
-  pull_request:
-    branches: [ main ]
-
 jobs:
-  test:
-    name: Run go test
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Go 1.25
-        uses: actions/setup-go@v4
-        with:
-          go-version: '1.25'
-
-      - name: Install dependencies
-        run: go mod download
-
-      - name: Run tests
-        run: |
-          mkdir -p coverage
-          go test ./... -v -coverprofile=coverage/coverage.out
-
-      - name: Upload coverage artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-report
-          path: coverage/coverage.out
 name: Go CI
 
 on:
@@ -42,71 +9,52 @@ on:
 
 jobs:
   test:
-    name: Test on ${{ matrix.go-version }}
+    name: Test (Go ${{ matrix.go-version }})
     runs-on: ubuntu-latest
-    name: Go CI
+    strategy:
+      matrix:
+        # Keep this in sync with your go.mod
+        go-version: [1.25.x]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    on:
-      push:
-        branches: [ main, 'feature/*' ]
-      pull_request:
-        branches: [ main ]
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ matrix.go-version }}
 
-    jobs:
-      test:
-        name: Test on ${{ matrix.go-version }}
-        runs-on: ubuntu-latest
-        strategy:
-          matrix:
-            go-version: [1.25.x, 1.26.x]
-        steps:
-          - name: Checkout
-            uses: actions/checkout@v4
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ${{ env.GOMODCACHE }}
+          key: ${{ runner.os }}-go-${{ matrix.go-version }}-modules-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-${{ matrix.go-version }}-modules-
 
-          - name: Set up Go
-            uses: actions/setup-go@v4
-            with:
-              go-version: ${{ matrix.go-version }}
+      - name: Install dependencies
+        run: go mod download
 
-          - name: Cache Go modules
-            uses: actions/cache@v4
-            with:
-              path: |
-                ~/.cache/go-build
-                ${{ env.GOMODCACHE }}
-              key: ${{ runner.os }}-go-${{ matrix.go-version }}-modules-${{ hashFiles('**/go.sum') }}
-              restore-keys: |
-                ${{ runner.os }}-go-${{ matrix.go-version }}-modules-
+      - name: Run go vet
+        run: go vet ./...
 
-          - name: Install dependencies
-            run: go mod download
+      - name: Run tests with coverage
+        run: |
+          mkdir -p coverage
+          go test ./... -v -coverprofile=coverage/coverage.out
 
-          - name: Run linter (golangci-lint)
-            uses: golangci/golangci-lint-action@v4
-            with:
-              version: v1.59.0
-              args: --config .golangci.yml ./...
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/coverage.out
 
-          - name: Run go vet
-            run: go vet ./...
-
-          - name: Run tests with coverage
-            run: |
-              mkdir -p coverage
-              go test ./... -v -coverprofile=coverage/coverage.out
-
-          - name: Upload coverage artifact
-            uses: actions/upload-artifact@v4
-            with:
-              name: coverage-report
-              path: coverage/coverage.out
-
-          - name: Build
-            run: go build ./...
-
-          - name: Upload coverage to Codecov (optional)
-            if: ${{ secrets.CODECOV_TOKEN != '' }}
-            uses: codecov/codecov-action@v4
-            with:
-              files: coverage/coverage.out
-              token: ${{ secrets.CODECOV_TOKEN }}
+      # Linter step (disabled): uncomment to enable golangci-lint in CI.
+      # Make sure .golangci.yml is tuned for your Go toolchain before enabling.
+      # - name: Run linter (golangci-lint)
+      #   uses: golangci/golangci-lint-action@v4
+      #   with:
+      #     version: v1.59.0
+      #     args: --config .golangci.yml ./...
