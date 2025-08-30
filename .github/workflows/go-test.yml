@@ -1,0 +1,80 @@
+---
+name: Go CI
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+    branches:
+      - '**'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      RUN_LINT: 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Fetch full history so tooling that reads VCS metadata (build stamping)
+          # can run inside the dockerized linter without failing with "error obtaining VCS status".
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.25'
+
+      - name: Install dependencies
+        run: go mod download
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Install golangci-lint (build with workflow Go)
+        if: env.RUN_LINT == 'true'
+        env:
+          GOFLAGS: '-buildvcs=false'
+        run: |
+          # Build golangci-lint with the same Go toolchain provided by actions/setup-go
+          # Pin the minor/patch to a known release compatible with v2 series
+          GOBIN=$(go env GOPATH)/bin \
+            go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.1.6
+
+      - name: Run golangci-lint
+        if: env.RUN_LINT == 'true'
+        env:
+          GOFLAGS: '-buildvcs=false'
+        run: |
+          set -x
+          $(go env GOPATH)/bin/golangci-lint run --timeout=6m
+
+      - name: Install staticcheck (built with workflow Go)
+        if: env.RUN_LINT == 'true'
+        run: |
+          # Install staticcheck using the Go toolchain already set up by actions/setup-go
+          # so the binary is compiled with the same Go version as the repo.
+          go install honnef.co/go/tools/cmd/staticcheck@latest
+
+      - name: Run staticcheck
+        if: env.RUN_LINT == 'true'
+        env:
+          # Avoid VCS stamping failures in some runners
+          GOFLAGS: '-buildvcs=false'
+        run: |
+          set -x
+          # Run the staticcheck binary installed into GOPATH/bin
+          $(go env GOPATH)/bin/staticcheck ./...
+
+      - name: Run tests with coverage
+        run: |
+          mkdir -p coverage
+          go test ./... -v -coverprofile=coverage/coverage.out
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/coverage.out

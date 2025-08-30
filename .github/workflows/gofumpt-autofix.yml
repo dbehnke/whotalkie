@@ -1,0 +1,115 @@
+name: gofumpt autofix
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  prepare:
+    name: Prepare PR info
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      head_ref: ${{ steps.get_pr.outputs.head_ref }}
+      head_repo: ${{ steps.get_pr.outputs.head_repo }}
+      pr_number: ${{ steps.get_pr.outputs.pr_number }}
+      is_fork: ${{ steps.get_pr.outputs.is_fork }}
+    steps:
+      - name: Get PR info
+        id: get_pr
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issueNum = context.issue.number;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const issue = await github.rest.issues.get({ owner, repo, issue_number: issueNum });
+            if (!issue.data.pull_request) {
+              core.setFailed('Comment is not on a pull request');
+              return;
+            }
+            const pr = await github.rest.pulls.get({ owner, repo, pull_number: issueNum });
+            const headRef = pr.data.head.ref;
+            const headRepo = pr.data.head.repo.full_name;
+            const isFork = headRepo !== `${owner}/${repo}`;
+            core.setOutput('head_ref', headRef);
+            core.setOutput('head_repo', headRepo);
+            core.setOutput('pr_number', String(pr.data.number));
+            core.setOutput('is_fork', String(isFork));
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  autofix:
+    name: Autofix with gofumpt
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    if: contains(github.event.comment.body, '/gofumpt')
+    steps:
+      - name: Check for forked PR
+        id: check_fork
+        run: |
+          echo "is_fork=${{ needs.prepare.outputs.is_fork }}" > is_fork.txt
+
+      - name: Notify and skip forked PRs
+        if: needs.prepare.outputs.is_fork == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issueNum = context.issue.number;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            await github.rest.issues.createComment({ owner, repo, issue_number: issueNum, body: "I can't push fixes to forked PRs. Please run 'gofumpt -w' locally and push the result, or re-run the workflow from a branch that lives in this repository." });
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout PR branch
+        if: needs.prepare.outputs.is_fork != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.prepare.outputs.head_repo }}
+          ref: ${{ needs.prepare.outputs.head_ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Go
+        if: needs.prepare.outputs.is_fork != 'true'
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.25'
+
+      - name: Install gofumpt
+        if: needs.prepare.outputs.is_fork != 'true'
+        run: |
+          go install mvdan.cc/gofumpt/cmd/gofumpt@latest
+
+      - name: Run gofumpt
+        if: needs.prepare.outputs.is_fork != 'true'
+        run: |
+          $HOME/go/bin/gofumpt -w .
+
+      - name: Commit and push changes
+        if: needs.prepare.outputs.is_fork != 'true'
+        uses: EndBug/add-and-commit@v9
+        with:
+          message: "style: run gofumpt"
+          add: '.'
+          author_name: 'github-actions[bot]'
+          author_email: '41898282+github-actions[bot]@users.noreply.github.com'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Comment result
+        if: needs.prepare.outputs.is_fork != 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issueNum = context.issue.number;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            await github.rest.issues.createComment({ owner, repo, issue_number: issueNum, body: `Ran gofumpt on branch\nref: ${{ needs.prepare.outputs.head_ref }}\nIf changes were applied, they were committed and pushed.` });
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

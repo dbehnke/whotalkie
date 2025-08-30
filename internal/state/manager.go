@@ -37,10 +37,12 @@ func (m *Manager) AddUser(user *types.User) {
 func (m *Manager) RemoveUser(userID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	
+
 	if user, exists := m.users[userID]; exists {
 		if user.Channel != "" {
-			m.removeUserFromChannel(userID, user.Channel)
+			if err := m.removeUserFromChannel(userID, user.Channel); err != nil {
+				log.Printf("Failed to remove user %s from channel %s: %v", userID, user.Channel, err)
+			}
 		}
 		delete(m.users, userID)
 	}
@@ -62,17 +64,17 @@ func (m *Manager) UpdateUser(user *types.User) {
 func (m *Manager) GetAllUsers() []*types.User {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	
+
 	users := make([]*types.User, 0, len(m.users))
 	for _, user := range m.users {
 		users = append(users, user)
 	}
-	
+
 	// Sort users by username for consistent ordering
 	sort.Slice(users, func(i, j int) bool {
 		return users[i].Username < users[j].Username
 	})
-	
+
 	return users
 }
 
@@ -84,8 +86,20 @@ func (m *Manager) AddClient(userID string, conn *types.WebSocketConnection) {
 
 func (m *Manager) RemoveClient(userID string) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.clients, userID)
+	client, exists := m.clients[userID]
+	if exists {
+		delete(m.clients, userID)
+	}
+	m.mu.Unlock()
+
+	// Close Send channel outside the lock to avoid deadlocks.
+	if exists && client != nil {
+		// Closing a channel that may already be closed can panic; ensure
+		// that only the manager is responsible for closing client Send
+		// channels to reduce risk of double-close. Callers should remove
+		// clients via RemoveClient and not close the channel themselves.
+		close(client.Send)
+	}
 }
 
 func (m *Manager) GetClient(userID string) (*types.WebSocketConnection, bool) {
@@ -98,7 +112,7 @@ func (m *Manager) GetClient(userID string) (*types.WebSocketConnection, bool) {
 func (m *Manager) GetAllClients() map[string]*types.WebSocketConnection {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	
+
 	clients := make(map[string]*types.WebSocketConnection)
 	for k, v := range m.clients {
 		clients[k] = v
@@ -109,7 +123,7 @@ func (m *Manager) GetAllClients() map[string]*types.WebSocketConnection {
 func (m *Manager) CreateChannel(channelID, name string) *types.Channel {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	
+
 	channel := &types.Channel{
 		ID:               channelID,
 		Name:             name,
@@ -121,7 +135,7 @@ func (m *Manager) CreateChannel(channelID, name string) *types.Channel {
 		Description:      "",
 		PublishOnlyCount: 0,
 	}
-	
+
 	m.channels[channelID] = channel
 	return channel
 }
@@ -136,12 +150,12 @@ func (m *Manager) GetChannel(channelID string) (*types.Channel, bool) {
 func (m *Manager) GetOrCreateChannel(channelID, name string) *types.Channel {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	
+
 	// Double-checked locking pattern to prevent race conditions
 	if channel, exists := m.channels[channelID]; exists {
 		return channel
 	}
-	
+
 	// Create channel while holding the lock
 	channel := &types.Channel{
 		ID:               channelID,
@@ -154,7 +168,7 @@ func (m *Manager) GetOrCreateChannel(channelID, name string) *types.Channel {
 		Description:      "",
 		PublishOnlyCount: 0,
 	}
-	
+
 	m.channels[channelID] = channel
 	return channel
 }
@@ -162,63 +176,76 @@ func (m *Manager) GetOrCreateChannel(channelID, name string) *types.Channel {
 func (m *Manager) GetAllChannels() []*types.Channel {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	
+
 	channels := make([]*types.Channel, 0, len(m.channels))
 	for _, channel := range m.channels {
 		channels = append(channels, channel)
 	}
-	
+
 	// Sort channels by name for consistent ordering
 	sort.Slice(channels, func(i, j int) bool {
 		return channels[i].Name < channels[j].Name
 	})
-	
+
 	return channels
+}
+
+// updatePublishOnlyCount updates the publish-only count when user status changes
+func (m *Manager) updatePublishOnlyCount(channel *types.Channel, oldUser *types.User, newUser *types.User) {
+	if oldUser.PublishOnly && !newUser.PublishOnly {
+		channel.PublishOnlyCount--
+	} else if !oldUser.PublishOnly && newUser.PublishOnly {
+		channel.PublishOnlyCount++
+	}
+}
+
+// updateExistingUserInChannel updates an existing user in the channel
+func (m *Manager) updateExistingUserInChannel(channel *types.Channel, user *types.User, userID string) bool {
+	for i, channelUser := range channel.Users {
+		if channelUser.ID == userID {
+			m.updatePublishOnlyCount(channel, &channelUser, user)
+			channel.Users[i] = *user
+			return true
+		}
+	}
+	return false
+}
+
+// addNewUserToChannel adds a new user to the channel
+func (m *Manager) addNewUserToChannel(channel *types.Channel, user *types.User) {
+	channel.Users = append(channel.Users, *user)
+	if user.PublishOnly {
+		channel.PublishOnlyCount++
+	}
 }
 
 func (m *Manager) JoinChannel(userID, channelID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	
+
 	user, userExists := m.users[userID]
 	if !userExists {
 		return ErrUserNotFound
 	}
-	
+
 	channel, channelExists := m.channels[channelID]
 	if !channelExists {
 		return ErrChannelNotFound
 	}
-	
+
 	if user.Channel != "" && user.Channel != channelID {
-		m.removeUserFromChannel(userID, user.Channel)
+		if err := m.removeUserFromChannel(userID, user.Channel); err != nil {
+			log.Printf("Failed to remove user %s from previous channel %s: %v", userID, user.Channel, err)
+		}
 	}
-	
+
 	user.Channel = channelID
 	user.IsActive = true
-	
-	found := false
-	for i, channelUser := range channel.Users {
-		if channelUser.ID == userID {
-			// Update publish-only count if status changed
-			if channelUser.PublishOnly && !user.PublishOnly {
-				channel.PublishOnlyCount--
-			} else if !channelUser.PublishOnly && user.PublishOnly {
-				channel.PublishOnlyCount++
-			}
-			channel.Users[i] = *user
-			found = true
-			break
-		}
+
+	if !m.updateExistingUserInChannel(channel, user, userID) {
+		m.addNewUserToChannel(channel, user)
 	}
-	
-	if !found {
-		channel.Users = append(channel.Users, *user)
-		if user.PublishOnly {
-			channel.PublishOnlyCount++
-		}
-	}
-	
+
 	return nil
 }
 
@@ -233,12 +260,12 @@ func (m *Manager) removeUserFromChannel(userID, channelID string) error {
 	if !userExists {
 		return ErrUserNotFound
 	}
-	
+
 	channel, channelExists := m.channels[channelID]
 	if !channelExists {
 		return ErrChannelNotFound
 	}
-	
+
 	for i, channelUser := range channel.Users {
 		if channelUser.ID == userID {
 			if channelUser.PublishOnly {
@@ -248,10 +275,10 @@ func (m *Manager) removeUserFromChannel(userID, channelID string) error {
 			break
 		}
 	}
-	
+
 	user.Channel = ""
 	user.IsActive = false
-	
+
 	return nil
 }
 
@@ -259,24 +286,24 @@ func (m *Manager) BroadcastEvent(event *types.PTTEvent) {
 	// Validate event type before conversion to prevent issues with invalid event types
 	eventType := types.PTTEventType(event.Type)
 	isCritical := false
-	
+
 	// Only check criticality for known event types to prevent panics
 	switch eventType {
-	case types.EventPTTStart, types.EventPTTEnd, types.EventUserJoin, 
-		 types.EventUserLeave, types.EventChannelJoin, types.EventChannelLeave,
-		 types.EventAudioData, types.EventHeartbeat:
+	case types.EventPTTStart, types.EventPTTEnd, types.EventUserJoin,
+		types.EventUserLeave, types.EventChannelJoin, types.EventChannelLeave,
+		types.EventAudioData, types.EventHeartbeat:
 		isCritical = eventType.IsCritical()
 	default:
 		// Unknown event type - treat as non-critical for safety
 		log.Printf("WARNING: Unknown event type received: %s", event.Type)
 		isCritical = false
 	}
-	
+
 	if isCritical {
 		// Use context with timeout for critical events to avoid deadlocks
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		
+
 		select {
 		case m.events <- event:
 			// Event delivered successfully
@@ -285,8 +312,8 @@ func (m *Manager) BroadcastEvent(event *types.PTTEvent) {
 			m.mu.Lock()
 			m.droppedCriticalEvents++
 			m.mu.Unlock()
-			
-			log.Printf("WARNING: Critical event dropped due to timeout: %s from user %s", 
+
+			log.Printf("WARNING: Critical event dropped due to timeout: %s from user %s",
 				event.Type, event.UserID)
 		}
 	} else {
@@ -306,21 +333,21 @@ func (m *Manager) GetEventChannel() <-chan *types.PTTEvent {
 func (m *Manager) GetStats() types.ServerStats {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	
+
 	activeUsers := 0
 	for _, user := range m.users {
 		if user.IsActive {
 			activeUsers++
 		}
 	}
-	
+
 	activeChannels := 0
 	for _, channel := range m.channels {
 		if channel.IsActive && len(channel.Users) > 0 {
 			activeChannels++
 		}
 	}
-	
+
 	return types.ServerStats{
 		TotalUsers:            len(m.users),
 		ActiveUsers:           activeUsers,
@@ -334,21 +361,21 @@ func (m *Manager) GetStats() types.ServerStats {
 // Shutdown gracefully closes the event channel and cleans up resources
 func (m *Manager) Shutdown() {
 	m.mu.Lock()
-	
+
 	// Close event channel to signal broadcast goroutine to stop
 	close(m.events)
-	
+
 	// Snapshot client connections to avoid deadlocks
 	clients := make([]*types.WebSocketConnection, 0, len(m.clients))
 	for _, client := range m.clients {
 		clients = append(clients, client)
 	}
 	m.mu.Unlock()
-	
+
 	// Close all client Send channels outside the lock to avoid deadlocks
 	for _, client := range clients {
 		close(client.Send)
 	}
-	
+
 	log.Printf("State manager shutdown complete")
 }
