@@ -6,7 +6,6 @@ run:
 
 linters:
   enable:
-    - gosimple     # simplify code
     - ineffassign  # detect ineffectual assignments
     - unused       # detect unused code (replacement for deadcode)
     - errcheck     # check for unchecked errors
