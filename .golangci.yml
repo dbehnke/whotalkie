@@ -7,14 +7,12 @@ linters:
   # (we'll disable problematic analyses in the CI invocation).
   disable-all: false
   enable:
-    - govet        # official go vet checks
-    - staticcheck  # modern static checks
     - gosimple     # simplify code
     - gofmt        # formatting (check only)
     - ineffassign  # detect ineffectual assignments
     - unused       # detect unused code (replacement for deadcode)
     - errcheck     # check for unchecked errors
-  # no explicit disabled linters here; CI invocation will selectively enable/disable
+  # Keep the config conservative; staticcheck/govet will be run separately in CI
 
 linters-settings:
   errcheck:
