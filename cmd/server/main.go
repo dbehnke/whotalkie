@@ -36,7 +36,7 @@ func validateChunkSize(eventData map[string]interface{}, userID string) (int64, 
 		log.Printf("SECURITY: Missing chunk size from user %s", userID)
 		return 0, false
 	}
-	
+
 	var chunkSizeInt int64
 	switch v := chunkSizeRaw.(type) {
 	case float64:
@@ -65,12 +65,12 @@ func validateChunkSize(eventData map[string]interface{}, userID string) (int64, 
 		log.Printf("SECURITY: Unexpected chunk size type from user %s: value=%v", userID, v)
 		return 0, false
 	}
-	
+
 	if chunkSizeInt > MaxAudioChunkSize || chunkSizeInt <= 0 {
 		log.Printf("SECURITY: Invalid chunk size rejected from user %s: %v bytes", userID, chunkSizeInt)
 		return 0, false
 	}
-	
+
 	return chunkSizeInt, true
 }
 
@@ -95,45 +95,45 @@ func isValidChannelName(channelName string) bool {
 	if len(channelName) == 0 || len(channelName) > 32 {
 		return false
 	}
-	
+
 	// Allow only alphanumeric characters, hyphens, underscores, and dots
 	for _, char := range channelName {
-		if !((char >= 'a' && char <= 'z') || 
-			 (char >= 'A' && char <= 'Z') || 
-			 (char >= '0' && char <= '9') || 
-			 char == '-' || char == '_' || char == '.') {
+		if !((char >= 'a' && char <= 'z') ||
+			(char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') ||
+			char == '-' || char == '_' || char == '.') {
 			return false
 		}
 	}
-	
+
 	// Additional security: prevent directory traversal patterns
-	if strings.Contains(channelName, "..") || 
-	   strings.HasPrefix(channelName, ".") || 
-	   strings.HasSuffix(channelName, ".") {
+	if strings.Contains(channelName, "..") ||
+		strings.HasPrefix(channelName, ".") ||
+		strings.HasSuffix(channelName, ".") {
 		return false
 	}
-	
+
 	return true
 }
 
 // isValidUsername validates usernames to prevent injection attacks
 func isValidUsername(username string) bool {
-	// Security: Username validation to prevent injection attacks  
+	// Security: Username validation to prevent injection attacks
 	if len(username) == 0 || len(username) > 32 {
 		return false
 	}
-	
+
 	// Allow alphanumeric, spaces, hyphens, underscores, and common punctuation
 	for _, char := range username {
 		if !((char >= 'a' && char <= 'z') ||
-			 (char >= 'A' && char <= 'Z') ||
-			 (char >= '0' && char <= '9') ||
-			 char == ' ' || char == '-' || char == '_' ||
-			 char == '.' || char == '(' || char == ')') {
+			(char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') ||
+			char == ' ' || char == '-' || char == '_' ||
+			char == '.' || char == '(' || char == ')') {
 			return false
 		}
 	}
-	
+
 	// Prevent usernames that could be confused with system messages
 	lowerUsername := strings.ToLower(strings.TrimSpace(username))
 	forbiddenNames := []string{"system", "server", "admin", "root", "null", "undefined"}
@@ -142,7 +142,7 @@ func isValidUsername(username string) bool {
 			return false
 		}
 	}
-	
+
 	return true
 }
 
@@ -164,25 +164,25 @@ func handleWebSocket(c *gin.Context) {
 
 	userID := uuid.New().String()
 	username := fmt.Sprintf("User_%s", userID[:8])
-	
+
 	user := &types.User{
 		ID:       userID,
 		Username: username,
 		Channel:  "",
 		IsActive: true,
 	}
-	
+
 	wsConn := &types.WebSocketConnection{
 		Conn:   conn,
 		UserID: userID,
 		Send:   make(chan []byte, 256),
 	}
-	
+
 	stateManager.AddUser(user)
 	stateManager.AddClient(userID, wsConn)
-	
+
 	log.Printf("New WebSocket connection: User %s (%s)", username, userID)
-	
+
 	stateManager.BroadcastEvent(&types.PTTEvent{
 		Type:      string(types.EventUserJoin),
 		UserID:    userID,
@@ -192,14 +192,13 @@ func handleWebSocket(c *gin.Context) {
 			"username": username,
 		},
 	})
-	
+
 	go handleClientWrite(wsConn)
-	
+
 	defer func() {
 		stateManager.RemoveUser(userID)
 		stateManager.RemoveClient(userID)
-		close(wsConn.Send)
-		
+
 		stateManager.BroadcastEvent(&types.PTTEvent{
 			Type:      string(types.EventUserLeave),
 			UserID:    userID,
@@ -209,10 +208,10 @@ func handleWebSocket(c *gin.Context) {
 				"username": username,
 			},
 		})
-		
+
 		log.Printf("User %s (%s) disconnected", username, userID)
 	}()
-	
+
 	handleClientRead(wsConn)
 }
 
@@ -220,14 +219,14 @@ func handleClientRead(wsConn *types.WebSocketConnection) {
 	ctx := context.Background()
 	var expectingAudioData bool
 	var audioMetadata *types.PTTEvent
-	
+
 	for {
 		msgType, message, err := wsConn.Conn.Read(ctx)
 		if err != nil {
 			log.Printf("WebSocket read error for user %s: %v", wsConn.UserID, err)
 			break
 		}
-		
+
 		switch msgType {
 		case websocket.MessageText:
 			// Handle JSON events
@@ -236,17 +235,20 @@ func handleClientRead(wsConn *types.WebSocketConnection) {
 				log.Printf("Failed to parse message from user %s: %v", wsConn.UserID, err)
 				continue
 			}
-			
+
 			event.UserID = wsConn.UserID
 			event.Timestamp = time.Now()
-			
+
 			// Check if this is audio metadata
 			if event.Type == string(types.EventAudioData) {
 				// Security: Validate chunk size to prevent memory exhaustion
-				if chunkSize, valid := validateChunkSize(event.Data, wsConn.UserID); !valid {
+				var chunkSize int64
+				var valid bool
+				chunkSize, valid = validateChunkSize(event.Data, wsConn.UserID)
+				if !valid {
 					continue
 				}
-				
+
 				expectingAudioData = true
 				audioMetadata = &event
 				format := "pcm" // Default to pcm for backward compatibility
@@ -257,14 +259,14 @@ func handleClientRead(wsConn *types.WebSocketConnection) {
 			} else {
 				handleEvent(&event)
 			}
-			
+
 		case websocket.MessageBinary:
 			// Security: Limit binary message size to prevent memory exhaustion
 			if len(message) > MaxAudioChunkSize {
 				log.Printf("SECURITY: Rejecting oversized binary message from user %s: %d bytes", wsConn.UserID, len(message))
 				continue
 			}
-			
+
 			// Handle binary audio data
 			if expectingAudioData && audioMetadata != nil {
 				handleAudioData(wsConn, audioMetadata, message)
@@ -348,14 +350,14 @@ func handleAudioData(wsConn *types.WebSocketConnection, metadata *types.PTTEvent
 
 func handleClientWrite(wsConn *types.WebSocketConnection) {
 	ctx := context.Background()
-	
+
 	for {
 		select {
 		case message, ok := <-wsConn.Send:
 			if !ok {
 				return
 			}
-			
+
 			// Determine message type by trying to parse as JSON
 			var messageType websocket.MessageType
 			var event types.PTTEvent
@@ -366,7 +368,7 @@ func handleClientWrite(wsConn *types.WebSocketConnection) {
 				// It's binary data, send as binary
 				messageType = websocket.MessageBinary
 			}
-			
+
 			if err := wsConn.Conn.Write(ctx, messageType, message); err != nil {
 				log.Printf("WebSocket write error for user %s: %v", wsConn.UserID, err)
 				return
@@ -377,7 +379,7 @@ func handleClientWrite(wsConn *types.WebSocketConnection) {
 
 func handleEvent(event *types.PTTEvent) {
 	log.Printf("Handling event: %s from user %s", event.Type, event.UserID)
-	
+
 	switch event.Type {
 	case string(types.EventChannelJoin):
 		handleChannelJoin(event)
@@ -404,23 +406,23 @@ func handleChannelJoin(event *types.PTTEvent) {
 		}
 		event.ChannelID = channelID
 	}
-	
+
 	// Security: Validate channel ID to prevent injection attacks
 	if !isValidChannelName(channelID) {
 		log.Printf("SECURITY: Invalid channel name rejected from user %s: %s", event.UserID, channelID)
 		return
 	}
-	
+
 	channel := stateManager.GetOrCreateChannel(channelID, channelID)
-	
+
 	user, _ := stateManager.GetUser(event.UserID)
-	
+
 	// Handle publish-only mode
 	if publishOnly, ok := event.Data["publish_only"].(bool); ok && publishOnly {
 		user.PublishOnly = true
 		log.Printf("User %s (%s) set to publish-only mode", user.Username, user.ID)
 	}
-	
+
 	// Update username if provided
 	if username, ok := event.Data["username"].(string); ok && username != "" {
 		// Security: Validate username to prevent injection attacks
@@ -430,22 +432,22 @@ func handleChannelJoin(event *types.PTTEvent) {
 			log.Printf("SECURITY: Invalid username rejected from user %s: %s", event.UserID, username)
 		}
 	}
-	
+
 	// Update user in state
 	stateManager.UpdateUser(user)
-	
+
 	// Now join channel with updated user data
 	if err := stateManager.JoinChannel(event.UserID, channelID); err != nil {
 		log.Printf("Failed to join channel %s: %v", channelID, err)
 		return
 	}
-	
+
 	event.Data = map[string]interface{}{
 		"username":     user.Username,
 		"channel_name": channel.Name,
 		"publish_only": user.PublishOnly,
 	}
-	
+
 	stateManager.BroadcastEvent(event)
 }
 
@@ -454,12 +456,12 @@ func handleChannelLeave(event *types.PTTEvent) {
 		log.Printf("Failed to leave channel %s: %v", event.ChannelID, err)
 		return
 	}
-	
+
 	user, _ := stateManager.GetUser(event.UserID)
 	event.Data = map[string]interface{}{
 		"username": user.Username,
 	}
-	
+
 	stateManager.BroadcastEvent(event)
 }
 
@@ -480,7 +482,7 @@ func handlePTTStart(event *types.PTTEvent) {
 	// This enables use cases like live radio, security monitoring, conference playback.
 	// See README.md "Channel Behavior & Broadcast Mode" for full documentation.
 	if !user.PublishOnly && channel.PublishOnlyCount > 0 {
-		log.Printf("PTT blocked for user %s in channel %s because %d publish-only user(s) present (broadcast mode)", 
+		log.Printf("PTT blocked for user %s in channel %s because %d publish-only user(s) present (broadcast mode)",
 			user.Username, channel.ID, channel.PublishOnlyCount)
 		return
 	}
@@ -509,18 +511,18 @@ func handlePTTEnd(event *types.PTTEvent) {
 	if !exists || user.Channel == "" {
 		return
 	}
-	
+
 	// Remove user from active speakers
 	channel, exists := stateManager.GetChannel(user.Channel)
 	if exists {
 		delete(channel.ActiveSpeakers, user.ID)
 	}
-	
+
 	event.ChannelID = user.Channel
 	event.Data = map[string]interface{}{
 		"username": user.Username,
 	}
-	
+
 	stateManager.BroadcastEvent(event)
 }
 
@@ -529,17 +531,17 @@ func handleHeartbeat(event *types.PTTEvent) {
 	if !exists {
 		return
 	}
-	
+
 	response := &types.PTTEvent{
 		Type:      string(types.EventHeartbeat),
 		UserID:    event.UserID,
 		Timestamp: time.Now(),
 		Data: map[string]interface{}{
-			"status": "pong",
+			"status":   "pong",
 			"username": user.Username,
 		},
 	}
-	
+
 	sendMessageToClient(event.UserID, response)
 }
 
@@ -552,13 +554,13 @@ func broadcastEvents(ctx context.Context) {
 				log.Println("Event channel closed, stopping broadcast goroutine")
 				return
 			}
-			
+
 			eventBytes, err := json.Marshal(event)
 			if err != nil {
 				log.Printf("Failed to marshal event: %v", err)
 				continue
 			}
-			
+
 			clients := stateManager.GetAllClients()
 			for _, client := range clients {
 				select {
@@ -576,13 +578,13 @@ func broadcastEvents(ctx context.Context) {
 
 func main() {
 	stateManager = state.NewManager()
-	
+
 	// Create context for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	
+
 	go broadcastEvents(ctx)
-	
+
 	r := gin.Default()
 
 	r.Static("/static", "./web/static")
@@ -590,7 +592,7 @@ func main() {
 
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
-			"status": "ok",
+			"status":  "ok",
 			"service": "whotalkie",
 		})
 	})
@@ -607,17 +609,17 @@ func main() {
 			"version": "0.1.0",
 		})
 	})
-	
+
 	r.GET("/api/stats", func(c *gin.Context) {
 		stats := stateManager.GetStats()
 		c.JSON(http.StatusOK, stats)
 	})
-	
+
 	r.GET("/api/users", func(c *gin.Context) {
 		users := stateManager.GetAllUsers()
 		c.JSON(http.StatusOK, gin.H{"users": users})
 	})
-	
+
 	r.GET("/api/channels", func(c *gin.Context) {
 		channels := stateManager.GetAllChannels()
 		c.JSON(http.StatusOK, gin.H{"channels": channels})
@@ -636,19 +638,19 @@ func main() {
 		sigChan := make(chan os.Signal, 1)
 		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 		<-sigChan
-		
+
 		log.Println("🛑 Shutting down server...")
-		
+
 		// Cancel broadcast context first to stop goroutines
 		cancel()
-		
+
 		// Shutdown state manager and close connections
 		stateManager.Shutdown()
-		
+
 		// Give active connections 30 seconds to finish
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer shutdownCancel()
-		
+
 		if err := server.Shutdown(shutdownCtx); err != nil {
 			log.Printf("Server forced to shutdown: %v", err)
 		} else {
