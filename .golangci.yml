@@ -1,0 +1,38 @@
+run:
+  timeout: 3m
+  tests: true
+
+linters:
+  disable-all: true
+  enable:
+    - govet        # official go vet checks
+    - staticcheck  # modern static checks
+    - gosimple     # simplify code
+    - gofmt        # formatting (check only)
+    - ineffassign  # detect ineffectual assignments
+    - unused       # detect unused code (replacement for deadcode)
+    - errcheck     # check for unchecked errors
+
+linters-settings:
+  errcheck:
+    # Allow ignoring common close error checks in tests and shutdown code.
+    excludeFuncs:
+      - Close
+
+issues:
+  # Allow a moderate number of issues per linter to avoid noisy CI failures while
+  # still surfacing important problems. Adjust thresholds as the project matures.
+  max-issues-per-linter: 50
+  max-same-issues: 10
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - errcheck
+    - linters:
+        - gofmt
+      text: "should have a comment"
+  exclude-dirs:
+    - web
+    - static
+
+# For reproducible runs in CI, lock the version in the workflow rather than here.

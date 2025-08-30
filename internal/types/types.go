@@ -48,8 +48,8 @@ type WebSocketConnection struct {
 }
 
 type ServerState struct {
-	Users    map[string]*User               `json:"users"`
-	Channels map[string]*Channel            `json:"channels"`
+	Users    map[string]*User                `json:"users"`
+	Channels map[string]*Channel             `json:"channels"`
 	Clients  map[string]*WebSocketConnection `json:"-"`
 }
 
