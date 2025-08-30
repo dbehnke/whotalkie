@@ -164,13 +164,22 @@ func isValidUsernameLength(username string) bool {
 	return len(username) > 0 && len(username) <= 32
 }
 
-// isValidUsernameChar validates a single character for usernames
-func isValidUsernameChar(char rune) bool {
+// isAlphanumeric checks if character is alphanumeric
+func isAlphanumeric(char rune) bool {
 	return (char >= 'a' && char <= 'z') ||
 		(char >= 'A' && char <= 'Z') ||
-		(char >= '0' && char <= '9') ||
-		char == ' ' || char == '-' || char == '_' ||
+		(char >= '0' && char <= '9')
+}
+
+// isSpecialUsernameChar checks if character is allowed special character
+func isSpecialUsernameChar(char rune) bool {
+	return char == ' ' || char == '-' || char == '_' ||
 		char == '.' || char == '(' || char == ')'
+}
+
+// isValidUsernameChar validates a single character for usernames
+func isValidUsernameChar(char rune) bool {
+	return isAlphanumeric(char) || isSpecialUsernameChar(char)
 }
 
 // isForbiddenUsername checks if username is in forbidden list

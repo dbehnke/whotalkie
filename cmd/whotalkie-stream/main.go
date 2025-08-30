@@ -3,11 +3,11 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"flag"
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"os"
 	"os/signal"
 	"strings"
@@ -52,26 +52,75 @@ func NewOggOpusParser() *OggOpusParser {
 	}
 }
 
+// findOggSync finds the Ogg sync pattern in buffer
+func (p *OggOpusParser) findOggSync() int {
+	for i := 0; i <= len(p.buffer)-4; i++ {
+		if p.buffer[i] == 'O' && p.buffer[i+1] == 'g' && p.buffer[i+2] == 'g' && p.buffer[i+3] == 'S' {
+			return i
+		}
+	}
+	return -1
+}
+
+// handleNoSync handles case when no sync pattern is found
+func (p *OggOpusParser) handleNoSync() {
+	// No sync found, keep last 3 bytes in case sync is split
+	if len(p.buffer) > 3 {
+		p.buffer = p.buffer[len(p.buffer)-3:]
+	}
+}
+
+// calculatePageSizes calculates header and payload sizes for Ogg page
+func (p *OggOpusParser) calculatePageSizes() (headerSize, payloadSize, totalPageSize int) {
+	pageSegments := int(p.buffer[26])
+	headerSize = 27 + pageSegments
+
+	for i := 0; i < pageSegments; i++ {
+		payloadSize += int(p.buffer[27+i])
+	}
+
+	totalPageSize = headerSize + payloadSize
+	return
+}
+
+// isOpusHeaderPacket checks if payload is an Opus header packet
+func isOpusHeaderPacket(payload []byte) bool {
+	if len(payload) <= 8 {
+		return false
+	}
+	headerType := string(payload[:8])
+	return headerType == "OpusHead" || headerType == "OpusTags"
+}
+
+// extractOpusPackets extracts individual Opus packets from payload
+func (p *OggOpusParser) extractOpusPackets(payload []byte, pageSegments int) [][]byte {
+	var packets [][]byte
+	segmentOffset := 0
+
+	for i := 0; i < pageSegments; i++ {
+		segmentSize := int(p.buffer[27+i])
+		if segmentOffset+segmentSize <= len(payload) && segmentSize > 0 {
+			// Extract individual Opus packet
+			opusPacket := make([]byte, segmentSize)
+			copy(opusPacket, payload[segmentOffset:segmentOffset+segmentSize])
+			packets = append(packets, opusPacket)
+			segmentOffset += segmentSize
+		}
+	}
+
+	return packets
+}
+
 func (p *OggOpusParser) Parse(data []byte) ([][]byte, error) {
 	p.buffer = append(p.buffer, data...)
 	var packets [][]byte
 
 	// Simple Ogg parser - look for Opus packets
 	for len(p.buffer) > 27 { // Minimum Ogg page header size
-		// Look for Ogg sync pattern "OggS"
-		syncPos := -1
-		for i := 0; i <= len(p.buffer)-4; i++ {
-			if p.buffer[i] == 'O' && p.buffer[i+1] == 'g' && p.buffer[i+2] == 'g' && p.buffer[i+3] == 'S' {
-				syncPos = i
-				break
-			}
-		}
+		syncPos := p.findOggSync()
 
 		if syncPos == -1 {
-			// No sync found, keep last 3 bytes in case sync is split
-			if len(p.buffer) > 3 {
-				p.buffer = p.buffer[len(p.buffer)-3:]
-			}
+			p.handleNoSync()
 			break
 		}
 
@@ -85,45 +134,18 @@ func (p *OggOpusParser) Parse(data []byte) ([][]byte, error) {
 			break
 		}
 
-		// Parse Ogg page header
-		pageSegments := int(p.buffer[26])
-		headerSize := 27 + pageSegments
+		headerSize, _, totalPageSize := p.calculatePageSizes()
 
-		if len(p.buffer) < headerSize {
-			break // Need more data
-		}
-
-		// Calculate total payload size
-		var payloadSize int
-		for i := 0; i < pageSegments; i++ {
-			payloadSize += int(p.buffer[27+i])
-		}
-
-		totalPageSize := headerSize + payloadSize
-		if len(p.buffer) < totalPageSize {
+		if len(p.buffer) < headerSize || len(p.buffer) < totalPageSize {
 			break // Need more data
 		}
 
 		// Extract payload (skip header pages with OpusHead/OpusTags)
 		payload := p.buffer[headerSize:totalPageSize]
-		if len(payload) > 8 {
-			// Skip header packets (OpusHead, OpusTags)
-			if !(len(payload) > 8 && string(payload[:8]) == "OpusHead") &&
-				!(len(payload) > 8 && string(payload[:8]) == "OpusTags") {
-
-				// Parse individual Opus packets from the Ogg page using segment table
-				segmentOffset := 0
-				for i := 0; i < pageSegments; i++ {
-					segmentSize := int(p.buffer[27+i])
-					if segmentOffset+segmentSize <= len(payload) && segmentSize > 0 {
-						// Extract individual Opus packet
-						opusPacket := make([]byte, segmentSize)
-						copy(opusPacket, payload[segmentOffset:segmentOffset+segmentSize])
-						packets = append(packets, opusPacket)
-						segmentOffset += segmentSize
-					}
-				}
-			}
+		if !isOpusHeaderPacket(payload) {
+			pageSegments := int(p.buffer[26])
+			extractedPackets := p.extractOpusPackets(payload, pageSegments)
+			packets = append(packets, extractedPackets...)
 		}
 
 		// Move to next page
@@ -208,7 +230,11 @@ func main() {
 	if err := client.ConnectWithRetry(); err != nil {
 		log.Fatalf("Failed to establish initial connection after retries: %v", err)
 	}
-	defer client.Close()
+	defer func() {
+		if err := client.Close(); err != nil {
+			log.Printf("Error closing client: %v", err)
+		}
+	}()
 
 	fmt.Printf("🎙️ WhoTalkie Stream Publisher\n")
 	fmt.Printf("   URL: %s\n", client.URL)
@@ -268,6 +294,47 @@ func (c *StreamClient) Connect() error {
 	return nil
 }
 
+// shouldStopRetrying checks if we should stop retrying
+func (c *StreamClient) shouldStopRetrying(err error) bool {
+	return c.maxRetries >= 0 && c.retryCount >= c.maxRetries
+}
+
+// getRetryDelay calculates the delay for the current retry attempt
+func (c *StreamClient) getRetryDelay() time.Duration {
+	delayIndex := c.retryCount
+	if delayIndex >= len(c.retryDelays) {
+		delayIndex = len(c.retryDelays) - 1
+	}
+	return c.retryDelays[delayIndex]
+}
+
+// handleSuccessfulConnection handles successful reconnection
+func (c *StreamClient) handleSuccessfulConnection() {
+	if c.retryCount > 0 {
+		fmt.Printf("\n✅ Reconnected successfully after %d attempts\n", c.retryCount)
+		c.retryCount = 0 // Reset retry count on successful connection
+	}
+}
+
+// handleFailedConnection handles failed connection attempts
+func (c *StreamClient) handleFailedConnection(err error) {
+	c.retryCount++
+	fmt.Printf("\n❌ Connection failed (attempt %d): %v\n", c.retryCount, err)
+	retryDelay := c.getRetryDelay()
+	fmt.Printf("🔄 Retrying in %v...\n", retryDelay)
+}
+
+// waitForRetry waits for retry delay or context cancellation
+func (c *StreamClient) waitForRetry() error {
+	retryDelay := c.getRetryDelay()
+	select {
+	case <-c.ctx.Done():
+		return c.ctx.Err()
+	case <-time.After(retryDelay):
+		return nil
+	}
+}
+
 func (c *StreamClient) ConnectWithRetry() error {
 	for {
 		select {
@@ -278,35 +345,62 @@ func (c *StreamClient) ConnectWithRetry() error {
 
 		err := c.Connect()
 		if err == nil {
-			if c.retryCount > 0 {
-				fmt.Printf("\n✅ Reconnected successfully after %d attempts\n", c.retryCount)
-				c.retryCount = 0 // Reset retry count on successful connection
-			}
+			c.handleSuccessfulConnection()
 			return nil
 		}
 
-		if c.maxRetries >= 0 && c.retryCount >= c.maxRetries {
+		if c.shouldStopRetrying(err) {
 			return fmt.Errorf("max retries (%d) exceeded: %w", c.maxRetries, err)
 		}
 
-		// Get retry delay (use last delay if we've exceeded the array length)
-		delayIndex := c.retryCount
-		if delayIndex >= len(c.retryDelays) {
-			delayIndex = len(c.retryDelays) - 1
-		}
-		retryDelay := c.retryDelays[delayIndex]
+		c.handleFailedConnection(err)
 
-		c.retryCount++
-		fmt.Printf("\n❌ Connection failed (attempt %d): %v\n", c.retryCount, err)
-		fmt.Printf("🔄 Retrying in %v...\n", retryDelay)
-
-		select {
-		case <-c.ctx.Done():
-			return c.ctx.Err()
-		case <-time.After(retryDelay):
-			continue
+		if err := c.waitForRetry(); err != nil {
+			return err
 		}
 	}
+}
+
+// processAudioData processes audio data and sends Opus packets
+func (c *StreamClient) processAudioData(data []byte, parser *OggOpusParser) error {
+	opusPackets, err := parser.Parse(data)
+	if err != nil {
+		log.Printf("Warning: Failed to parse Ogg data: %v", err)
+		// Fallback: try sending raw data (might be pre-extracted Opus)
+		return c.sendAudioChunk(data)
+	}
+
+	// Send each extracted Opus packet
+	for _, packet := range opusPackets {
+		if err := c.sendAudioChunk(packet); err != nil {
+			return fmt.Errorf("failed to send opus packet: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// readAudioChunk reads a chunk of audio data from stdin
+func (c *StreamClient) readAudioChunk(reader *bufio.Reader, buffer []byte) ([]byte, error) {
+	n, err := reader.Read(buffer)
+	if err != nil {
+		if err == io.EOF {
+			return nil, err
+		}
+		return nil, fmt.Errorf("failed to read from stdin: %w", err)
+	}
+
+	if n == 0 {
+		return nil, nil
+	}
+
+	return buffer[:n], nil
+}
+
+// updateStreamStats updates streaming statistics
+func (c *StreamClient) updateStreamStats(bytesRead int) {
+	c.stats.TotalBytes += int64(bytesRead)
+	c.stats.TotalChunks++
 }
 
 func (c *StreamClient) StreamFromStdin() error {
@@ -325,35 +419,18 @@ func (c *StreamClient) StreamFromStdin() error {
 			return nil
 		default:
 			// Read chunk from stdin
-			n, err := reader.Read(buffer)
+			chunk, err := c.readAudioChunk(reader, buffer)
 			if err != nil {
-				if err == io.EOF {
-					return err
-				}
-				return fmt.Errorf("failed to read from stdin: %w", err)
+				return err
 			}
 
-			if n > 0 {
-				// Parse Ogg container to extract Opus packets
-				opusPackets, err := parser.Parse(buffer[:n])
-				if err != nil {
-					log.Printf("Warning: Failed to parse Ogg data: %v", err)
-					// Fallback: try sending raw data (might be pre-extracted Opus)
-					if err := c.sendAudioChunk(buffer[:n]); err != nil {
-						return fmt.Errorf("failed to send raw audio chunk: %w", err)
-					}
-				} else {
-					// Send each extracted Opus packet
-					for _, packet := range opusPackets {
-						if err := c.sendAudioChunk(packet); err != nil {
-							return fmt.Errorf("failed to send opus packet: %w", err)
-						}
-					}
+			if chunk != nil {
+				if err := c.processAudioData(chunk, parser); err != nil {
+					return err
 				}
 
 				// Update statistics
-				c.stats.TotalBytes += int64(n)
-				c.stats.TotalChunks++
+				c.updateStreamStats(len(chunk))
 			}
 		}
 	}
@@ -381,7 +458,9 @@ func (c *StreamClient) StreamFromStdinWithRetry() error {
 
 			// Close current connection
 			if c.conn != nil {
-				c.conn.Close(websocket.StatusAbnormalClosure, "Connection lost")
+				if err := c.conn.Close(websocket.StatusAbnormalClosure, "Connection lost"); err != nil {
+					log.Printf("Error closing connection: %v", err)
+				}
 				c.conn = nil
 			}
 
@@ -399,6 +478,40 @@ func (c *StreamClient) StreamFromStdinWithRetry() error {
 	}
 }
 
+// hasConnectionKeyword checks if error contains connection-related keywords
+func hasConnectionKeyword(errorStr string) bool {
+	connectionKeywords := []string{
+		"connection reset", "connection refused", "broken pipe",
+		"websocket", "network", "timeout", "closed",
+	}
+
+	for _, keyword := range connectionKeywords {
+		if strings.Contains(errorStr, keyword) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasWriteKeyword checks if error contains write-related keywords
+func hasWriteKeyword(errorStr string) bool {
+	writeKeywords := []string{
+		"failed to write", "failed to flush", "failed to marshal JSON",
+	}
+
+	for _, keyword := range writeKeywords {
+		if strings.Contains(errorStr, keyword) {
+			return true
+		}
+	}
+	return false
+}
+
+// isNonStdinEOF checks if error is EOF but not from stdin
+func isNonStdinEOF(errorStr string) bool {
+	return strings.Contains(errorStr, "EOF") && !strings.Contains(errorStr, "stdin")
+}
+
 func (c *StreamClient) isConnectionError(err error) bool {
 	if err == nil {
 		return false
@@ -406,17 +519,9 @@ func (c *StreamClient) isConnectionError(err error) bool {
 
 	errorStr := err.Error()
 	// Check for common connection-related error patterns
-	return strings.Contains(errorStr, "connection reset") ||
-		strings.Contains(errorStr, "connection refused") ||
-		strings.Contains(errorStr, "broken pipe") ||
-		strings.Contains(errorStr, "websocket") ||
-		strings.Contains(errorStr, "network") ||
-		strings.Contains(errorStr, "timeout") ||
-		strings.Contains(errorStr, "closed") ||
-		strings.Contains(errorStr, "failed to write") ||
-		strings.Contains(errorStr, "failed to flush") ||
-		strings.Contains(errorStr, "failed to marshal JSON") ||
-		(strings.Contains(errorStr, "EOF") && !strings.Contains(errorStr, "stdin"))
+	return hasConnectionKeyword(errorStr) ||
+		hasWriteKeyword(errorStr) ||
+		isNonStdinEOF(errorStr)
 }
 
 func (c *StreamClient) sendAudioChunk(data []byte) error {
@@ -504,7 +609,9 @@ func (c *StreamClient) Close() error {
 				"username": c.Alias,
 			},
 		}
-		wsjson.Write(c.ctx, c.conn, pttEndEvent)
+		if err := wsjson.Write(c.ctx, c.conn, pttEndEvent); err != nil {
+			log.Printf("Error sending PTT end event: %v", err)
+		}
 
 		return c.conn.Close(websocket.StatusNormalClosure, "Stream ended")
 	}
@@ -514,8 +621,16 @@ func (c *StreamClient) Close() error {
 func generateRandomID() string {
 	const charset = "abcdefghijklmnopqrstuvwxyz0123456789"
 	b := make([]byte, 12)
+	randBytes := make([]byte, 12)
+
+	if _, err := rand.Read(randBytes); err != nil {
+		log.Printf("Error generating random ID: %v", err)
+		// Fallback to timestamp-based ID
+		return fmt.Sprintf("fallback%d", time.Now().UnixNano()%1000000)
+	}
+
 	for i := range b {
-		b[i] = charset[rand.Intn(len(charset))]
+		b[i] = charset[int(randBytes[i])%len(charset)]
 	}
 	return string(b)
 }
