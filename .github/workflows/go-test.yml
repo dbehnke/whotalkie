@@ -35,7 +35,7 @@ jobs:
 
       - name: Run golangci-lint
         if: env.RUN_LINT == 'true'
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v7
         with:
           version: v2.1
           args: --timeout=6m
