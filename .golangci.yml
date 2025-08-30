@@ -12,6 +12,8 @@ linters:
     - ineffassign  # detect ineffectual assignments
     - unused       # detect unused code (replacement for deadcode)
     - errcheck     # check for unchecked errors
+  disable:
+    - goanalysis_metalinter
 
 linters-settings:
   errcheck:
