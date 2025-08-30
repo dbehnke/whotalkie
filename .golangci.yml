@@ -14,8 +14,7 @@ linters:
     - ineffassign  # detect ineffectual assignments
     - unused       # detect unused code (replacement for deadcode)
     - errcheck     # check for unchecked errors
-  disable:
-    - goanalysis_metalinter
+  # no explicit disabled linters here; CI invocation will selectively enable/disable
 
 linters-settings:
   errcheck:

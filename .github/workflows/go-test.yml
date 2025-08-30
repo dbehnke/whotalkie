@@ -41,8 +41,31 @@ jobs:
           # when the docker container cannot access full git metadata.
           GOFLAGS: '-buildvcs=false'
         with:
-          # Disable goanalysis_metalinter which can fail in CI due to export-data format issues
-          args: golangci-lint run --timeout=6m --config .golangci.yml --disable=goanalysis_metalinter ./...
+          # Run a minimal, safe set of linters inside the golangci-lint container to avoid
+          # goanalysis/metalinter export-data issues in the runner. For deeper analysis we
+          # run staticcheck separately (installed with the workflow Go version).
+          args: >-
+            golangci-lint run --timeout=6m
+            --disable-all
+            --enable=gofmt,gofumpt,goimports,errcheck,gosimple,ineffassign,misspell,lll,unused
+            ./...
+
+      - name: Install staticcheck (built with workflow Go)
+        if: env.RUN_LINT == 'true'
+        run: |
+          # Install staticcheck using the Go toolchain already set up by actions/setup-go
+          # so the binary is compiled with the same Go version as the repo.
+          go install honnef.co/go/tools/cmd/staticcheck@latest
+
+      - name: Run staticcheck
+        if: env.RUN_LINT == 'true'
+        env:
+          # Avoid VCS stamping failures in some runners
+          GOFLAGS: '-buildvcs=false'
+        run: |
+          set -x
+          # Run the staticcheck binary installed into GOPATH/bin
+          $(go env GOPATH)/bin/staticcheck ./...
 
       - name: Run tests with coverage
         run: |
