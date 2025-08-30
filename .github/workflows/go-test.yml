@@ -41,7 +41,9 @@ jobs:
           # when the docker container cannot access full git metadata.
           GOFLAGS: '-buildvcs=false'
         with:
-          args: golangci-lint run --timeout=6m --config .golangci.yml ./...
+          # Disable goanalysis_metalinter which can fail in CI with "unsupported version: 2"
+          # due to mismatched export-data formats between toolchains.
+          args: golangci-lint run --timeout=6m --config .golangci.yml --disable=goanalysis_metalinter ./...
 
       - name: Run tests with coverage
         run: |
