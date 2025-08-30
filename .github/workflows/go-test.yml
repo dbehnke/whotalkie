@@ -33,7 +33,8 @@ jobs:
         uses: golangci/golangci-lint-action@v4
         with:
           version: v1.59.0
-          args: --timeout=3m
+          args: --timeout=6m
+          install-mode: from-source
         env:
           GOLANGCI_LINT_CACHE: ${{ runner.temp }}/golangci-cache
 
