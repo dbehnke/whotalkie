@@ -12,6 +12,8 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      RUN_LINT: 'true'
     steps:
       - uses: actions/checkout@v4
 
@@ -25,6 +27,15 @@ jobs:
 
       - name: Run go vet
         run: go vet ./...
+
+      - name: Run golangci-lint (optional)
+        if: env.RUN_LINT == 'true'
+        uses: golangci/golangci-lint-action@v4
+        with:
+          version: v1.59.0
+          args: --timeout=3m
+        env:
+          GOLANGCI_LINT_CACHE: ${{ runner.temp }}/golangci-cache
 
       - name: Run tests with coverage
         run: |
