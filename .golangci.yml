@@ -1,24 +1,37 @@
+version: "2"
+
 run:
   timeout: 3m
   tests: true
 
 linters:
-  # Do not use global disable-all here so the CLI can pass --disable flags
-  # (we'll disable problematic analyses in the CI invocation).
-  disable-all: false
   enable:
     - gosimple     # simplify code
     - gofmt        # formatting (check only)
     - ineffassign  # detect ineffectual assignments
     - unused       # detect unused code (replacement for deadcode)
     - errcheck     # check for unchecked errors
-  # Keep the config conservative; staticcheck/govet will be run separately in CI
+    - govet        # official Go static analysis tool
+    - gosec        # security vulnerability detection
+    - copyloopvar  # Go 1.22+ loop variable behavior
+    - cyclop       # cyclomatic complexity checking
+  # Keep the config conservative; staticcheck will be run separately in CI
 
 linters-settings:
   errcheck:
     # Allow ignoring common close error checks in tests and shutdown code.
     excludeFuncs:
       - Close
+  
+  cyclop:
+    # Set maximum cyclomatic complexity for functions (default is 10)
+    max-complexity: 15
+  
+  gosec:
+    # Configure which security checks to run
+    excludes:
+      - G104  # Audit errors not checked (covered by errcheck)
+    severity: medium
 
 issues:
   # Allow a moderate number of issues per linter to avoid noisy CI failures while

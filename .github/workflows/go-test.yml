@@ -33,22 +33,12 @@ jobs:
       - name: Run go vet
         run: go vet ./...
 
-      - name: Install golangci-lint (built with workflow Go)
-        if: env.RUN_LINT == 'true'
-        env:
-          GOFLAGS: '-buildvcs=false'
-        run: |
-          # Install golangci-lint using the same Go toolchain configured by actions/setup-go
-          env GOBIN=$(go env GOPATH)/bin go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.59.0
-
       - name: Run golangci-lint
         if: env.RUN_LINT == 'true'
-        env:
-          GOFLAGS: '-buildvcs=false'
-        run: |
-          # Run a minimal, safe set of linters to avoid metalinter export-data issues.
-          $(go env GOPATH)/bin/golangci-lint run --timeout=6m --disable-all \
-            --enable=gofmt,gofumpt,goimports,errcheck,gosimple,ineffassign,misspell,lll,unused ./...
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v2.1
+          args: --timeout=6m
 
       - name: Install staticcheck (built with workflow Go)
         if: env.RUN_LINT == 'true'
