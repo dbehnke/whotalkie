@@ -755,7 +755,6 @@ func handleHeartbeat(stateManager *state.Manager, event *types.PTTEvent) {
 func (s *Server) broadcastEvents() {
 	// Track consecutive failures per client for cleanup
 	clientFailures := make(map[string]int)
-	const maxConsecutiveFailures = 5 // Clean up after 5 consecutive failures
 
 	for {
 		select {
@@ -772,40 +771,61 @@ func (s *Server) broadcastEvents() {
 				continue
 			}
 
-			clients := s.stateManager.GetAllClients()
-			var clientsToRemove []string
-
-			for userID, client := range clients {
-				select {
-				case client.Send <- eventBytes:
-					// Reset failure count on successful send
-					delete(clientFailures, userID)
-				default:
-					// Track consecutive failures
-					clientFailures[userID]++
-					failureCount := clientFailures[userID]
-
-					log.Printf("Client %s send channel full (failure %d/%d)",
-						userID, failureCount, maxConsecutiveFailures)
-
-					// Mark for removal if too many failures
-					if failureCount >= maxConsecutiveFailures {
-						clientsToRemove = append(clientsToRemove, userID)
-						log.Printf("Marking client %s for cleanup due to consecutive failures", userID)
-					}
-				}
-			}
-
-			// Clean up problematic clients outside the iteration
-			for _, userID := range clientsToRemove {
-				go s.cleanupDisconnectedClient(userID)
-				delete(clientFailures, userID)
-			}
+			s.broadcastToClients(eventBytes, clientFailures)
 
 		case <-s.ctx.Done():
 			log.Println("Context cancelled, stopping broadcast goroutine")
 			return
 		}
+	}
+}
+
+// broadcastToClients handles broadcasting to all clients with failure tracking
+func (s *Server) broadcastToClients(eventBytes []byte, clientFailures map[string]int) {
+	const maxConsecutiveFailures = 5 // Clean up after 5 consecutive failures
+
+	clients := s.stateManager.GetAllClients()
+	var clientsToRemove []string
+
+	for userID, client := range clients {
+		if s.sendToClient(client, eventBytes, userID) {
+			// Reset failure count on successful send
+			delete(clientFailures, userID)
+		} else {
+			// Track consecutive failures
+			clientFailures[userID]++
+			failureCount := clientFailures[userID]
+
+			log.Printf("Client %s send channel full (failure %d/%d)",
+				userID, failureCount, maxConsecutiveFailures)
+
+			// Mark for removal if too many failures
+			if failureCount >= maxConsecutiveFailures {
+				clientsToRemove = append(clientsToRemove, userID)
+				log.Printf("Marking client %s for cleanup due to consecutive failures", userID)
+			}
+		}
+	}
+
+	// Clean up problematic clients outside the iteration
+	s.cleanupFailedClients(clientsToRemove, clientFailures)
+}
+
+// sendToClient attempts to send data to a client, returns true on success
+func (s *Server) sendToClient(client *types.WebSocketConnection, eventBytes []byte, userID string) bool {
+	select {
+	case client.Send <- eventBytes:
+		return true
+	default:
+		return false
+	}
+}
+
+// cleanupFailedClients removes clients that have exceeded failure threshold
+func (s *Server) cleanupFailedClients(clientsToRemove []string, clientFailures map[string]int) {
+	for _, userID := range clientsToRemove {
+		go s.cleanupDisconnectedClient(userID)
+		delete(clientFailures, userID)
 	}
 }
 
