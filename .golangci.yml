@@ -7,7 +7,7 @@ run:
 linters:
   enable:
     - gosimple     # simplify code
-    - gofmt        # formatting (check only)
+    - gofumpt      # stricter formatting (gofumpt)
     - ineffassign  # detect ineffectual assignments
     - unused       # detect unused code (replacement for deadcode)
     - errcheck     # check for unchecked errors
@@ -42,9 +42,6 @@ issues:
     - path: _test\.go
       linters:
         - errcheck
-    - linters:
-        - gofmt
-      text: "should have a comment"
   exclude-dirs:
     - web
     - static
