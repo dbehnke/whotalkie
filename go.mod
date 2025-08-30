@@ -3,9 +3,9 @@ module whotalkie
 go 1.25.0
 
 require (
+	github.com/coder/websocket v1.8.13
 	github.com/gin-gonic/gin v1.10.1
 	github.com/google/uuid v1.6.0
-	nhooyr.io/websocket v1.8.17
 )
 
 require (

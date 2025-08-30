@@ -40,7 +40,9 @@ func (m *Manager) RemoveUser(userID string) {
 
 	if user, exists := m.users[userID]; exists {
 		if user.Channel != "" {
-			m.removeUserFromChannel(userID, user.Channel)
+			if err := m.removeUserFromChannel(userID, user.Channel); err != nil {
+				log.Printf("Failed to remove user %s from channel %s: %v", userID, user.Channel, err)
+			}
 		}
 		delete(m.users, userID)
 	}
@@ -188,6 +190,35 @@ func (m *Manager) GetAllChannels() []*types.Channel {
 	return channels
 }
 
+// updatePublishOnlyCount updates the publish-only count when user status changes
+func (m *Manager) updatePublishOnlyCount(channel *types.Channel, oldUser *types.User, newUser *types.User) {
+	if oldUser.PublishOnly && !newUser.PublishOnly {
+		channel.PublishOnlyCount--
+	} else if !oldUser.PublishOnly && newUser.PublishOnly {
+		channel.PublishOnlyCount++
+	}
+}
+
+// updateExistingUserInChannel updates an existing user in the channel
+func (m *Manager) updateExistingUserInChannel(channel *types.Channel, user *types.User, userID string) bool {
+	for i, channelUser := range channel.Users {
+		if channelUser.ID == userID {
+			m.updatePublishOnlyCount(channel, &channelUser, user)
+			channel.Users[i] = *user
+			return true
+		}
+	}
+	return false
+}
+
+// addNewUserToChannel adds a new user to the channel
+func (m *Manager) addNewUserToChannel(channel *types.Channel, user *types.User) {
+	channel.Users = append(channel.Users, *user)
+	if user.PublishOnly {
+		channel.PublishOnlyCount++
+	}
+}
+
 func (m *Manager) JoinChannel(userID, channelID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -203,32 +234,16 @@ func (m *Manager) JoinChannel(userID, channelID string) error {
 	}
 
 	if user.Channel != "" && user.Channel != channelID {
-		m.removeUserFromChannel(userID, user.Channel)
+		if err := m.removeUserFromChannel(userID, user.Channel); err != nil {
+			log.Printf("Failed to remove user %s from previous channel %s: %v", userID, user.Channel, err)
+		}
 	}
 
 	user.Channel = channelID
 	user.IsActive = true
 
-	found := false
-	for i, channelUser := range channel.Users {
-		if channelUser.ID == userID {
-			// Update publish-only count if status changed
-			if channelUser.PublishOnly && !user.PublishOnly {
-				channel.PublishOnlyCount--
-			} else if !channelUser.PublishOnly && user.PublishOnly {
-				channel.PublishOnlyCount++
-			}
-			channel.Users[i] = *user
-			found = true
-			break
-		}
-	}
-
-	if !found {
-		channel.Users = append(channel.Users, *user)
-		if user.PublishOnly {
-			channel.PublishOnlyCount++
-		}
+	if !m.updateExistingUserInChannel(channel, user, userID) {
+		m.addNewUserToChannel(channel, user)
 	}
 
 	return nil

@@ -103,7 +103,9 @@ func TestGetStats_BasicCounts(t *testing.T) {
 	m.AddUser(&types.User{ID: "s1", Username: "S1", IsActive: true})
 	m.AddUser(&types.User{ID: "s2", Username: "S2", IsActive: true})
 	m.GetOrCreateChannel("alpha", "Alpha")
-	m.JoinChannel("s1", "alpha")
+	if err := m.JoinChannel("s1", "alpha"); err != nil {
+		t.Fatalf("Failed to join channel: %v", err)
+	}
 
 	stats := m.GetStats()
 	if stats.TotalUsers != 2 {

@@ -3,7 +3,7 @@ package types
 import (
 	"time"
 
-	"nhooyr.io/websocket"
+	"github.com/coder/websocket"
 )
 
 type User struct {
