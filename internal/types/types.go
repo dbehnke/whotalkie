@@ -3,24 +3,34 @@ package types
 import (
 	"time"
 
-	"nhooyr.io/websocket"
+	"github.com/coder/websocket"
 )
 
 type User struct {
-	ID       string `json:"id"`
-	Username string `json:"username"`
-	Channel  string `json:"channel"`
-	IsActive bool   `json:"is_active"`
+	ID          string `json:"id"`
+	Username    string `json:"username"`
+	Channel     string `json:"channel"`
+	IsActive    bool   `json:"is_active"`
+	PublishOnly bool   `json:"publish_only,omitempty"`
+}
+
+type SpeakerState struct {
+	UserID    string    `json:"user_id"`
+	Username  string    `json:"username"`
+	StartTime time.Time `json:"start_time"`
+	IsTalking bool      `json:"is_talking"`
 }
 
 type Channel struct {
-	ID          string    `json:"id"`
-	Name        string    `json:"name"`
-	Users       []User    `json:"users"`
-	CreatedAt   time.Time `json:"created_at"`
-	MaxUsers    int       `json:"max_users"`
-	IsActive    bool      `json:"is_active"`
-	Description string    `json:"description,omitempty"`
+	ID               string                  `json:"id"`
+	Name             string                  `json:"name"`
+	Users            []User                  `json:"users"`
+	ActiveSpeakers   map[string]SpeakerState `json:"active_speakers"`
+	CreatedAt        time.Time               `json:"created_at"`
+	MaxUsers         int                     `json:"max_users"`
+	IsActive         bool                    `json:"is_active"`
+	Description      string                  `json:"description,omitempty"`
+	PublishOnlyCount int                     `json:"publish_only_count,omitempty"`
 }
 
 type PTTEvent struct {
@@ -38,8 +48,8 @@ type WebSocketConnection struct {
 }
 
 type ServerState struct {
-	Users    map[string]*User               `json:"users"`
-	Channels map[string]*Channel            `json:"channels"`
+	Users    map[string]*User                `json:"users"`
+	Channels map[string]*Channel             `json:"channels"`
 	Clients  map[string]*WebSocketConnection `json:"-"`
 }
 
@@ -55,3 +65,24 @@ const (
 	EventAudioData    PTTEventType = "audio_data"
 	EventHeartbeat    PTTEventType = "heartbeat"
 )
+
+// IsCritical returns true if the event type is critical and should be delivered with timeout protection
+func (e PTTEventType) IsCritical() bool {
+	switch e {
+	case EventPTTStart, EventPTTEnd, EventUserJoin, EventUserLeave, EventChannelJoin, EventChannelLeave:
+		return true
+	default:
+		return false
+	}
+}
+
+type ServerStats struct {
+	TotalUsers            int `json:"total_users"`
+	ActiveUsers           int `json:"active_users"`
+	TotalChannels         int `json:"total_channels"`
+	ActiveChannels        int `json:"active_channels"`
+	ConnectedClients      int `json:"connected_clients"`
+	DroppedCriticalEvents int `json:"dropped_critical_events"`
+	EventBufferLength     int `json:"event_buffer_length"`
+	EventBufferCapacity   int `json:"event_buffer_capacity"`
+}
