@@ -15,10 +15,6 @@ linters:
     - cyclop       # cyclomatic complexity checking
   # Keep the config conservative; staticcheck will be run separately in CI
 
-formatters:
-  enable:
-    - gofumpt
-
 linters-settings:
   errcheck:
     # Allow ignoring common close error checks in tests and shutdown code.
