@@ -7,7 +7,6 @@ run:
 linters:
   enable:
     - gosimple     # simplify code
-    - gofumpt      # stricter formatting (gofumpt)
     - ineffassign  # detect ineffectual assignments
     - unused       # detect unused code (replacement for deadcode)
     - errcheck     # check for unchecked errors
@@ -16,6 +15,10 @@ linters:
     - copyloopvar  # Go 1.22+ loop variable behavior
     - cyclop       # cyclomatic complexity checking
   # Keep the config conservative; staticcheck will be run separately in CI
+
+formatters:
+  enable:
+    - gofumpt
 
 linters-settings:
   errcheck:

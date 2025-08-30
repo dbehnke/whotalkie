@@ -68,6 +68,17 @@ jobs:
           # Run the staticcheck binary installed into GOPATH/bin
           $(go env GOPATH)/bin/staticcheck ./...
 
+      - name: Install gofumpt
+        if: env.RUN_LINT == 'true'
+        run: |
+          go install mvdan.cc/gofumpt/cmd/gofumpt@latest
+
+      - name: Run gofumpt (format check)
+        if: env.RUN_LINT == 'true'
+        run: |
+          set -x
+          $HOME/go/bin/gofumpt -l .
+
       - name: Run tests with coverage
         run: |
           mkdir -p coverage
