@@ -38,6 +38,7 @@ jobs:
         uses: golangci/golangci-lint-action@v7
         with:
           version: v2.1
+          install-mode: source
           args: --timeout=6m
 
       - name: Install staticcheck (built with workflow Go)
