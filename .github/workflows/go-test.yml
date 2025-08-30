@@ -36,6 +36,10 @@ jobs:
       - name: Run golangci-lint (docker)
         if: env.RUN_LINT == 'true'
         uses: docker://golangci/golangci-lint:v1.59.0
+        env:
+          # Disable VCS stamping inside the Go toolchain so typecheck prints no VCS errors
+          # when the docker container cannot access full git metadata.
+          GOFLAGS: '-buildvcs=false'
         with:
           args: golangci-lint run --timeout=6m --config .golangci.yml ./...
 
