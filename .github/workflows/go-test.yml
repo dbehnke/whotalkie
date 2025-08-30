@@ -32,7 +32,7 @@ jobs:
         if: env.RUN_LINT == 'true'
         uses: docker://golangci/golangci-lint:v1.59.0
         with:
-          args: run --timeout=6m --config .golangci.yml ./...
+          args: golangci-lint run --timeout=6m --config .golangci.yml ./...
 
       - name: Run tests with coverage
         run: |
