@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"whotalkie/internal/stream"
 	"whotalkie/internal/types"
 )
 
@@ -16,6 +17,8 @@ type Manager struct {
 	channels              map[string]*types.Channel
 	clients               map[string]*types.WebSocketConnection
 	events                chan *types.PTTEvent
+	// streamBuffers holds per-channel live Ogg raw stream buffers for HTTP proxying
+	streamBuffers         map[string]*stream.Buffer
 	droppedCriticalEvents int  // Track dropped critical events for monitoring
 	isShuttingDown        bool // Flag to prevent race conditions during shutdown
 }
@@ -31,7 +34,8 @@ func NewManager() *Manager {
 		users:    make(map[string]*types.User),
 		channels: make(map[string]*types.Channel),
 		clients:  make(map[string]*types.WebSocketConnection),
-		events:   make(chan *types.PTTEvent, DefaultEventBufferSize),
+	events:   make(chan *types.PTTEvent, DefaultEventBufferSize),
+	streamBuffers: make(map[string]*stream.Buffer),
 	}
 }
 
@@ -48,9 +52,42 @@ func NewManagerWithBufferSize(bufferSize int) *Manager {
 		users:    make(map[string]*types.User),
 		channels: make(map[string]*types.Channel),
 		clients:  make(map[string]*types.WebSocketConnection),
-		events:   make(chan *types.PTTEvent, bufferSize),
+	events:   make(chan *types.PTTEvent, bufferSize),
+	streamBuffers: make(map[string]*stream.Buffer),
 	}
 }
+
+// GetOrCreateStreamBuffer returns an existing buffer for the channel or creates one.
+func (m *Manager) GetOrCreateStreamBuffer(channelID string) *stream.Buffer {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if b, ok := m.streamBuffers[channelID]; ok {
+		return b
+	}
+	// default buffer size 1MB
+	b := stream.NewBuffer(1<<20)
+	m.streamBuffers[channelID] = b
+	return b
+}
+
+// GetStreamBuffer returns the buffer if present
+func (m *Manager) GetStreamBuffer(channelID string) (*stream.Buffer, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	b, ok := m.streamBuffers[channelID]
+	return b, ok
+}
+
+// CloseStreamBuffer closes and removes the buffer for a channel
+func (m *Manager) CloseStreamBuffer(channelID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if b, ok := m.streamBuffers[channelID]; ok {
+		_ = b.Close()
+		delete(m.streamBuffers, channelID)
+	}
+}
+
 
 func (m *Manager) AddUser(user *types.User) {
 	m.mu.Lock()
@@ -425,6 +462,14 @@ func (m *Manager) Shutdown() {
 			close(client.Send)
 		}
 		delete(m.clients, userID)
+	}
+
+	// Close stream buffers
+	for ch, buf := range m.streamBuffers {
+		if buf != nil {
+			_ = buf.Close()
+		}
+		delete(m.streamBuffers, ch)
 	}
 
 	log.Printf("State manager shutdown complete")

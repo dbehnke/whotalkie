@@ -1,0 +1,17 @@
+name: CID Literal Lint
+
+on:
+  push:
+    branches: [ main, variable-bitrate ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  cid-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run CID literal lint
+        run: |
+          chmod +x ./bin/check-cid-literals.sh
+          ./bin/check-cid-literals.sh
