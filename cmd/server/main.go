@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"sync/atomic"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -123,6 +125,13 @@ const (
 // constructing on-the-wire frames. This prevents attempting to encode a
 // payload length that doesn't fit in a 16-bit length field.
 const MaxOpusPayloadSize = 0xFFFF
+
+// Ping/Pong supervision settings. Tests override these for speed.
+var PingInterval = 20 * time.Second
+var PongTimeout = 40 * time.Second
+var PingWriteTimeout = 5 * time.Second
+// How many consecutive ping write failures will be tolerated before closing
+var PingFailureThreshold int32 = 3
 
 // Note: negotiation codes and welcome keys moved to `pkg/protocol`
 
@@ -429,10 +438,16 @@ func createDefaultCapabilities(clientType string, userAgent string, isWeb bool) 
 }
 
 func (s *Server) handleWebSocket(c *gin.Context) {
+	// Prepare a lastPong holder and AcceptOptions with OnPongReceived so the
+	// underlying websocket.Conn will invoke our callback when a pong arrives.
+	var lastPong int64
 	conn, err := websocket.Accept(c.Writer, c.Request, &websocket.AcceptOptions{
 		// Security: Restrict origins to localhost for development
 		// TODO: Configure proper origins for production deployment
 		OriginPatterns: []string{"localhost:*", "127.0.0.1:*", "http://localhost:*", "http://127.0.0.1:*"},
+		OnPongReceived: func(ctx context.Context, payload []byte) {
+			atomic.StoreInt64(&lastPong, time.Now().UnixNano())
+		},
 	})
 	if err != nil {
 		log.Printf("Failed to upgrade connection: %v", err)
@@ -486,7 +501,13 @@ func (s *Server) handleWebSocket(c *gin.Context) {
 		stateManager: s.stateManager,
 		server:       s,
 		cid:          cid,
+		// lastPong pointer will be set just below so pingLoop can observe it
+		lastPong:     nil,
 	}
+
+	// Attach the lastPong pointer used by AcceptOptions so the connection's
+	// OnPongReceived callback updates the same location the pingLoop watches.
+	connectionManager.lastPong = &lastPong
 
 	connectionManager.initialize()
 	defer connectionManager.cleanup()
@@ -515,6 +536,10 @@ type ConnectionManager struct {
 	cid            string
 	// pubMu guards publisherWriter and publisherCancel
 	pubMu sync.Mutex
+	// lastPong points to unix nanoseconds of the last pong received (nil if not set)
+	lastPong *int64
+	// pingFailures counts consecutive ping write failures
+	pingFailures int32
 }
 
 func (cm *ConnectionManager) initialize() {
@@ -536,6 +561,14 @@ func (cm *ConnectionManager) initialize() {
 			"username": cm.username,
 		},
 	})
+
+	// Set initial lastPong to now if pointer present
+	if cm.lastPong != nil {
+		atomic.StoreInt64(cm.lastPong, time.Now().UnixNano())
+	}
+
+	// Start ping supervisor goroutine
+	go cm.pingLoop()
 }
 
 func (cm *ConnectionManager) cleanup() {
@@ -631,6 +664,55 @@ func (cm *ConnectionManager) handleClientWrite() {
 	}
 }
 
+// pingLoop periodically sends ping frames to the client and checks for timely pongs.
+func (cm *ConnectionManager) pingLoop() {
+	ticker := time.NewTicker(PingInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-cm.ctx.Done():
+			return
+		case <-ticker.C:
+			// Send ping with short write timeout using Conn.Ping
+			pwCtx, cancel := context.WithTimeout(cm.ctx, PingWriteTimeout)
+			if err := cm.conn.Ping(pwCtx); err != nil {
+				cancel()
+				z := zlog.Error().Str("user_id", cm.userID).Err(err)
+				if cm.cid != "" {
+					z = z.Str("cid", cm.cid)
+				}
+				z.Msg("WebSocket ping write error")
+
+				// Increment failure counter and only close after threshold
+				f := atomic.AddInt32(&cm.pingFailures, 1)
+				if f >= PingFailureThreshold {
+					zlog.Warn().Str("user_id", cm.userID).Int32("failures", f).Msg("ping failure threshold exceeded; closing")
+					cm.cancel()
+					return
+				}
+			} else {
+				// Reset failures on success
+				atomic.StoreInt32(&cm.pingFailures, 0)
+			}
+			cancel()
+
+			// Check last pong time if available
+			if cm.lastPong != nil {
+				last := time.Unix(0, atomic.LoadInt64(cm.lastPong))
+				if time.Since(last) > PongTimeout {
+					z := zlog.Warn().Str("user_id", cm.userID).Dur("since_last_pong", time.Since(last))
+					if cm.cid != "" {
+						z = z.Str("cid", cm.cid)
+					}
+					z.Msg("No recent pong; closing connection")
+					cm.cancel()
+					return
+				}
+			}
+		}
+	}
+}
+
 // detectMessageType inspects the message bytes and returns an appropriate
 // websocket.MessageType (text for JSON, binary otherwise).
 func (cm *ConnectionManager) detectMessageType(message []byte) websocket.MessageType {
@@ -675,17 +757,9 @@ func (cm *ConnectionManager) handleClientRead() {
 			cancel()
 
 			if err != nil {
-				// Check if it's a normal close
-				if websocket.CloseStatus(err) == websocket.StatusNormalClosure {
-					zlog.Info().Str("user_id", cm.userID).Str("cid", cm.cid).Msg("WebSocket normal close")
-				} else {
-					z := zlog.Error().Str("user_id", cm.userID).Err(err)
-					if cm.cid != "" {
-						z = z.Str("cid", cm.cid)
-					}
-					z.Msg("WebSocket read error")
+				if cm.handleReadError(err) {
+					continue
 				}
-				cm.cancel() // Trigger cleanup
 				return
 			}
 
@@ -697,6 +771,37 @@ func (cm *ConnectionManager) handleClientRead() {
 			}
 		}
 	}
+}
+
+// handleReadError centralizes error handling for reads and returns true when
+// the caller should continue the read loop (e.g., on deadline expired), or
+// false when the caller should exit the loop. The function will call cm.cancel
+// when it decides the connection must be terminated due to an error.
+func (cm *ConnectionManager) handleReadError(err error) bool {
+	// If the read context deadline expired, this is an idle timeout and not a
+	// fatal connection error. Continue reading so idle clients are not
+	// disconnected.
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+
+	// If the context was cancelled, exit gracefully.
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+
+	// Check if it's a normal close
+	if websocket.CloseStatus(err) == websocket.StatusNormalClosure {
+		zlog.Info().Str("user_id", cm.userID).Str("cid", cm.cid).Msg("WebSocket normal close")
+	} else {
+		z := zlog.Error().Str("user_id", cm.userID).Err(err)
+		if cm.cid != "" {
+			z = z.Str("cid", cm.cid)
+		}
+		z.Msg("WebSocket read error")
+	}
+	cm.cancel() // Trigger cleanup
+	return false
 }
 
 func (cm *ConnectionManager) handleTextMessage(message []byte, expectingAudioData *bool, audioMetadata **types.PTTEvent) {

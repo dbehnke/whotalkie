@@ -867,11 +867,19 @@ function connect() {
     
     ws = new WebSocket('ws://localhost:8080/ws');
     
+    let heartbeatInterval = null;
     ws.onopen = function() {
         connectionStatus.classList.add('connected');
         connectionText.textContent = 'Connected';
         addMessage('Connected to server');
         updateStats();
+        // Start app-level heartbeat every 20s to help intermediaries and
+        // clients that do not surface control frames to the server.
+        heartbeatInterval = setInterval(() => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'heartbeat' }));
+            }
+        }, 20000);
     };
     
     ws.onmessage = function(event) {
@@ -914,6 +922,10 @@ function connect() {
         addMessage('Disconnected from server. Reconnecting in 3s...');
         pttButton.disabled = true;
         ws = null;
+        if (heartbeatInterval) {
+            clearInterval(heartbeatInterval);
+            heartbeatInterval = null;
+        }
         setTimeout(connect, 3000);
     };
     
