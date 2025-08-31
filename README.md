@@ -236,6 +236,26 @@ The server runs with sensible defaults:
 - **HTTP Port**: 8080
 - **Opus Settings**: 48kHz, 32kbps, mono
 - **WebSocket**: Real-time event handling
+
+Liveness and heartbeat expectations
+----------------------------------
+
+Clients must respond to WebSocket pings (or otherwise read from the
+connection) so the server can detect unresponsive peers. The server sends
+periodic pings (default every 20s) and expects a pong within a configured
+timeout (default 40s). Clients that do not respond may be disconnected after
+repeated failures.
+
+If you're implementing a lightweight client, either:
+
+- Ensure your WebSocket library processes control frames (pings/pongs). Many
+    libraries do this automatically if you run a read loop.
+- Or send periodic application-level heartbeat events (e.g., a JSON
+    `"heartbeat"` event every ~20s); the server will treat missing heartbeats as a
+    sign of a dead connection.
+
+These defaults are configurable on the server for testing and can be tuned to
+match client behavior in production.
 - **Audio Buffer**: 2048 samples for latency/performance balance
 
 ## 📚 Client Library & Architecture

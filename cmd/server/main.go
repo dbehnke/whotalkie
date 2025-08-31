@@ -438,6 +438,7 @@ func createDefaultCapabilities(clientType string, userAgent string, isWeb bool) 
 }
 
 func (s *Server) handleWebSocket(c *gin.Context) {
+	zlog.Debug().Str("remote", c.Request.RemoteAddr).Msg("handleWebSocket start")
 	// Prepare a lastPong holder and AcceptOptions with OnPongReceived so the
 	// underlying websocket.Conn will invoke our callback when a pong arrives.
 	var lastPong int64
@@ -786,13 +787,20 @@ func (cm *ConnectionManager) handleClientRead() {
 		case <-cm.ctx.Done():
 			return
 		default:
-			// Set read timeout
-			readCtx, cancel := context.WithTimeout(cm.ctx, 30*time.Second)
-			msgType, message, err := cm.wsConn.Conn.Read(readCtx)
-			cancel()
+			// Read using the connection lifecycle context. Previously we used
+			// a per-read 30s timeout which surfaced as deadline errors that the
+			// underlying websocket implementation turned into closed network
+			// connection errors. That caused spurious disconnects at ~30s even
+			// when transport pongs or application heartbeats were present.
+			// Rely on the ping/pong and app-heartbeat supervisor for liveness
+			// detection instead of cancelling the underlying net.Conn here.
+			msgType, message, err := cm.wsConn.Conn.Read(cm.ctx)
 
 			if err != nil {
 				if cm.handleReadError(err) {
+					// handleReadError returned true when the error is non-fatal
+					// to the read loop (for example context.DeadlineExpired in
+					// prior implementations). Continue the loop.
 					continue
 				}
 				return
@@ -2201,7 +2209,10 @@ func (s *Server) Run() error {
 	s.httpServer = &http.Server{
 		Addr:              ":8080",
 		Handler:           s.router,
-		ReadHeaderTimeout: 30 * time.Second,
+	// The default 30s header read timeout can cause upgrade handshakes
+	// to be aborted in environments with slow proxies or intermediaries.
+	// Increase to 2 minutes to reduce spurious 101/handshake closes.
+	ReadHeaderTimeout: 2 * time.Minute,
 	}
 
 	// Handle graceful shutdown in a separate goroutine

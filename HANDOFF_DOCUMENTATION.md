@@ -292,3 +292,35 @@ whotalkie-stream [OPTIONS]
 - Clients/publishers are free to use cgo (libogg/libopus) locally to perform demuxing and then send raw Opus frames + JSON metadata to the server.
 
 **Current Status**: Enhanced system ready for production deployment phase 🚀
+
+## 🔌 Reconnection & Resume (unexpected disconnects)
+
+If a client is disconnected unexpectedly, clients should automatically attempt to re-establish their session and resume where possible. Add the following guidance to client implementations and operations runbooks.
+
+Client recommendations
+- Auto-reconnect with exponential backoff (e.g., 1s, 2s, 4s, 8s...) up to a ceiling (30s). Keep retry attempts idempotent.
+- On reconnect, send a `hello` event that includes the previous `user_id` (if available), alias/username, and the channel the client was in. Example below.
+- After a successful hello, rejoin the previous channel (either via the `hello` extras or a subsequent `channel_join` event) and restore UI state (selected channel, PTT button state).
+- Publish-only clients should resume publishing by re-sending audio metadata and continuing the stream; use a small pre-roll buffer if desired to avoid gaps.
+- If the client wants to take over an existing stale connection, include a `takeover` flag in the hello so the server can close the prior connection and re-associate state.
+
+Server expectations
+- The server should accept reconnection attempts that present the same `user_id` and re-associate state when no conflict exists.
+- If a prior connection appears active, the server may accept a takeover request (explicit `takeover` in `hello`) and close the old connection before associating the new one.
+- Treat re-joins as ordinary join events for UI and analytics (broadcast `user_join` as appropriate).
+
+Sample reconnect hello payload
+```json
+{
+  "type": "hello",
+  "user_id": "previous-user-id",
+  "alias": "MyName",
+  "channel": "previous-channel",
+  "takeover": true
+}
+```
+
+Troubleshooting
+- If clients repeatedly fail to reconnect, verify proxy/load-balancer timeouts (handshake/idle timeouts) and server `ReadHeaderTimeout` and ping/pong settings.
+- Correlate disconnect and reconnect attempts using server logs (CID and `user_id`).
+- Consider adding explicit server-side diagnostics (per-connection last-seen timestamps, last ping/pong) if recurring disconnects persist.
