@@ -42,6 +42,11 @@ type Demuxer struct {
 	partialContinued bool
 }
 
+// SampleRate is the default sample rate assumed for Opus payloads when
+// converting granule positions to timestamps. Centralizing this makes it
+// easier to keep the demuxer and other packages consistent.
+const SampleRate = 48000
+
 // New creates a Demuxer that will read Ogg data from r.
 func New(r io.Reader) *Demuxer {
 	return &Demuxer{r: bufio.NewReader(r)}
@@ -170,7 +175,9 @@ func (d *Demuxer) makePacket(cur []byte, gp uint64) Packet {
 	if len(pkt.Data) >= 8 && string(pkt.Data[0:8]) == "OpusTags" {
 		pkt.IsVorbisComment = true
 	}
-	if len(pkt.Data) >= 9 && string(pkt.Data[0:8]) == "OpusHead" {
+	// OpusHead layout: "OpusHead" (8 bytes) + version (1 byte) + channel_count (1 byte)
+	// Ensure we have at least 10 bytes before reading the channel count at index 9.
+	if len(pkt.Data) >= 10 && string(pkt.Data[0:8]) == "OpusHead" {
 		ch := int(pkt.Data[9])
 		if ch > 0 {
 			d.lastChannels = ch
@@ -200,6 +207,6 @@ func (d *Demuxer) PacketTimestampUS(pkt *Packet) uint64 {
 		return 0
 	}
 	// granule position counts PCM samples (per channel) of the last sample
-	// Convert to microseconds: samples * 1e6 / 48000
-	return (pkt.GranulePos * 1000000) / 48000
+	// Convert to microseconds: samples * 1e6 / SampleRate
+	return (pkt.GranulePos * 1000000) / uint64(SampleRate)
 }
