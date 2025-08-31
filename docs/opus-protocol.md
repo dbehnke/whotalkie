@@ -1,19 +1,21 @@
 # WhoTalkie Opus Transport & Ogg Demux Spec
 
-This document describes the designed transport for WhoTalkie:
-- Interactive PTT: framed raw Opus packets over WebSocket (low-latency).
-- Publish-only streams: accept Ogg/Opus input, demux into raw Opus frames + metadata, broadcast frames to WebCodecs-capable web clients, and proxy original Ogg bytes for native/non-web listeners.
+This document describes the designed transport for WhoTalkie.
 
-Keep server pass-through: no server-side re-encoding.
+High-level design change (server responsibility):
+- The server is responsible only for proxying and relaying framed raw Opus packets and metadata messages between clients. It does not perform container demuxing in the common case.
+- Publish-only streamers (clients) are responsible for demuxing Ogg/Opus (or extracting Opus frames from other containers) and sending raw Opus frames and any associated metadata (e.g. song title, artist) to the server.
+
+Keep server pass-through: no server-side re-encoding. The server should only forward raw Opus bytes and compact JSON metadata messages.
 
 ---
 
 ## Requirements checklist
 
 - [x] Interactive PTT uses framed raw Opus packets over WebSocket (mono, 32kbps).
-- [x] Publish-only sources may provide Ogg/Opus. Server demuxes Ogg into Opus packets and Vorbis comment metadata.
-- [x] Server broadcasts framed Opus binary messages to subscribers who prefer `opus-raw` or `webcodecs`.
-- [x] Server exposes `GET /stream/:channel.ogg` HTTP endpoint that proxies the original Ogg bytes (preserving Vorbis comments/metadata) for native players.
+- [x] Publish-only streamers demux any container formats (Ogg/Opus, WebM, etc.) locally and send raw Opus frames and metadata to the server; the server does not demux by default.
+- [x] Server broadcasts framed Opus binary messages to subscribers who prefer `webcodecs` or `opus-raw`.
+- [ ] (Optional) Server may provide HTTP proxy endpoints for raw container bytes in specific deployments; this is not required for the core design.
 - [x] Clients perform capability negotiation at WebSocket connect; server routes accordingly.
 
 ---
@@ -23,10 +25,10 @@ Keep server pass-through: no server-side re-encoding.
 1. Client connects over WebSocket to `/ws`.
 2. Client sends a JSON `hello` with capabilities.
 3. Server responds with acceptance and any current `meta` for the joined channel.
-4. Publishers (publish-only) may send Ogg bytes (container) as their input. Server demuxes Ogg and emits:
-   - JSON `meta` messages when Vorbis comments / ICY metadata change.
-   - Binary framed Opus packets to subscribers.
-   - Keeps original Ogg stream available via HTTP for non-web clients.
+4. Publishers (publish-only) are expected to demux any containers locally and send the server:
+  - JSON `meta` messages when metadata changes (title, artist, tags). Metadata messages are small UTF-8 JSON frames.
+  - Binary framed raw Opus packets (using the framing spec below) for audio payloads.
+  The server simply relays these messages to subscribers; it does not need to inspect or parse container formats.
 5. Interactive PTT clients send framed Opus packets directly (no container).
 
 ---
@@ -121,83 +123,33 @@ Clients should accept frames with variable `payload_len` and use timestamp/seq t
 
 ---
 
-## Server-side Ogg demux pseudo-code (high-level)
+## Publisher responsibilities (demux on the client)
 
-Goal: accept an Ogg/Opus byte stream from a publish-only source, extract Vorbis comments (metadata) and Opus packet payloads, and broadcast frames to subscribers.
+Publishers that ingest container formats (Ogg/Opus, WebM, etc.) should:
 
-Notes: This is pseudo-code — adapt to your actual Go server architecture and concurrency model.
+- Demux the container locally and extract raw Opus packets and metadata.
+- Send compact JSON `meta` messages to the server when metadata (Vorbis comments, ICY tags, etc.) changes.
+- Send framed binary raw Opus packets to the server using the agreed framing format (below).
+- Optionally keep a local copy or HTTP proxy of the original container if you need to support native players — the server does not require this.
 
-```go
-// Accept a connection from a publisher (streamer)
-func handlePublisher(conn net.Conn, channel string) {
-    // 1) keep raw Ogg stream available for HTTP proxy
-    oggReader := bufio.NewReader(conn)
-    // Start goroutine to copy raw bytes into a ring buffer used by HTTP proxy
-    go copyRawToRing(channelRawBuffer(channel), oggReader)
+Rationale: pushing demuxing to clients simplifies the server, reduces server CPU and complexity, and avoids introducing cgo requirements into the server build.
 
-    // 2) initialize an Ogg demuxer on the same byte stream
-    demux := oggdemux.New(oggReader)
-
-    var lastTags map[string]string
-    seq := uint32(0)
-
-    for {
-        page, err := demux.NextPage()
-        if err == io.EOF { break }
-        if err != nil { log.Println("demux error", err); break }
-
-        // demux returns logical packets (Opus packets or comment/header packets)
-        for _, pkt := range page.Packets {
-            if pkt.IsVorbisComment {
-                tags := parseVorbisComment(pkt.Data)
-                if !equal(tags, lastTags) {
-                    lastTags = tags
-                    broadcastJSONToSubscribers(channel, metaMessage(channel, tags))
-                }
-                continue
-            }
-
-            if pkt.IsOpus {
-                // create framed binary message
-                tsUs := demux.PacketTimestampUS(pkt)
-                frame := frameHeader(seq, tsUs, pkt.Channels, len(pkt.Data))
-                frame = append(frame, pkt.Data...)
-                broadcastBinaryToSubscribers(channel, frame)
-                seq++
-            }
-        }
-    }
-
-    // publisher ended
-    broadcastJSONToSubscribers(channel, publisherStopMessage(channel))
-}
-```
-
-Implementation notes:
-- `oggdemux` is a conceptual demuxer that exposes Ogg pages and logical packets.
-- Use an efficient ring buffer for the raw Ogg HTTP proxy to avoid blocking the publisher.
-- Consider backpressure: if HTTP clients are slow, drop or disconnect them rather than blocking the publisher.
+Note on backpressure and silence: clients SHOULD avoid sending audio frames during extended silence; the server will not transmit audio data when none is received for a channel. Metadata messages should still be sent when relevant.
 
 ---
 
-## Recommended Go library options / approaches
+## Recommended approach
 
-Two main approaches to implement Ogg demuxing in Go:
+Because the server no longer needs to demux containers by default, there are two practical choices:
 
-A) Integrate a pure-Go Ogg demuxer/demultiplexer (preferred if it exists and meets needs):
-- Advantages: easier deployment (no cgo), Go-level concurrency, natural integration.
-- Candidate ideas: look for active projects providing Ogg/Opus demuxing. If a maintained project is available, prefer that.
+1. Keep the current `internal/oggdemux` scaffold for in-repo testing and optional server-side demuxing in special deployments.
+2. Prefer implementing demuxing in publish-only clients (streamers). For client-side implementations you can choose a pure-Go demuxer (no cgo) or use libogg via cgo depending on requirements and platform constraints.
 
-B) Use libogg/libopus via cgo or a small C wrapper:
-- Advantages: mature, tested demuxing in libogg; more reliable handling of edge cases in streamed Ogg.
-- Use cgo to call libogg APIs to parse pages and extract packets, then pass packet bytes to Go runtime.
-- Tradeoff: introduces cgo, build complexity.
-
-Opus packet utilities in Go:
-- `github.com/hraban/opus` — Go bindings for libopus (useful for optional packet introspection).
+Opus packet utilities in Go (useful for client-side tooling):
+- `github.com/hraban/opus` — Go bindings for libopus (optional packet introspection).
 - `github.com/pion/rtp` — useful if you want RTP fallback or packet structures (not required for raw ws framing).
 
-Notes: evaluate candidate libraries for maintenance status and compatibility with your Go version. If no trustworthy pure-Go demuxer is available, prefer cgo + libogg, then wrap into an internal package (e.g. `internal/oggdemux`).
+If you later decide to support server-side container proxy endpoints (e.g., `GET /stream/:channel.ogg`), you can provide them as optional deployment features that are populated by client upload or server-side demuxing helpers.
 
 ---
 

@@ -286,4 +286,9 @@ whotalkie-stream [OPTIONS]
 - [ ] **Reverse proxy setup** (Caddy configuration for HTTPS, domain routing)
 - [ ] **Production security** (rate limiting, input validation, CORS policies)
 
+## Server build policy
+
+- The server codebase MUST remain pure Go (no cgo) to preserve simple cross-compilation and production buildability. Any heavy-weight container demuxing that requires native libraries (libogg/libopus) should be implemented in client streamers (publish-only clients) or provided as optional, out-of-tree tooling.
+- Clients/publishers are free to use cgo (libogg/libopus) locally to perform demuxing and then send raw Opus frames + JSON metadata to the server.
+
 **Current Status**: Enhanced system ready for production deployment phase 🚀

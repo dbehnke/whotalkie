@@ -78,3 +78,29 @@ jobs:
         with:
           name: coverage-report
           path: coverage/coverage.out
+
+  # Verify server packages build with CGO disabled to enforce pure-Go server policy
+  server-purego:
+    name: "Server: pure-Go build"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.25'
+
+      - name: Install dependencies
+        run: go mod download
+
+      - name: Build server with CGO disabled
+        env:
+          CGO_ENABLED: '0'
+        run: |
+          set -x
+          # Ensure the server builds without cgo
+          CGO_ENABLED=0 go build ./cmd/server

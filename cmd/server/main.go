@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -39,6 +38,8 @@ import (
 	"whotalkie/internal/stream"
 	"whotalkie/internal/state"
 	"whotalkie/internal/types"
+
+	"whotalkie/pkg/protocol"
 
 	cidpkg "whotalkie/internal/cid"
 )
@@ -116,6 +117,8 @@ func init() {
 const (
 	MaxAudioChunkSize = 1024 * 1024 // 1MB limit for audio chunks to prevent memory exhaustion
 )
+
+// Note: negotiation codes and welcome keys moved to `pkg/protocol`
 
 // parseChunkSizeValue parses a chunk size value from various types
 func parseChunkSizeValue(chunkSizeRaw interface{}, userID string) (int64, bool) {
@@ -344,11 +347,11 @@ func validateAudioFormat(user *types.User, format types.AudioFormat) error {
 // validateWebClientLimits enforces stricter limits for web (PTT) clients.
 func validateWebClientLimits(user *types.User, format types.AudioFormat) error {
 	if user.IsWebClient && !user.PublishOnly {
-		if format.Bitrate > 32000 {
-			return errors.New("web clients limited to 32kbps for PTT transmission")
+			if format.Bitrate > 32000 {
+			return &formatError{Code: protocol.CodeWebBitrateLimit, Msg: "web clients limited to 32kbps for PTT transmission"}
 		}
 		if format.Channels > 1 {
-			return errors.New("web clients limited to mono for PTT transmission")
+			return &formatError{Code: protocol.CodeWebChannelsLimit, Msg: "web clients limited to mono for PTT transmission"}
 		}
 	}
 	return nil
@@ -357,19 +360,27 @@ func validateWebClientLimits(user *types.User, format types.AudioFormat) error {
 // validateBasicFormatConstraints checks generic audio format constraints.
 func validateBasicFormatConstraints(format types.AudioFormat) error {
 	if format.Bitrate < 8000 || format.Bitrate > 320000 {
-		return errors.New("bitrate must be between 8kbps and 320kbps")
+		return &formatError{Code: protocol.CodeBitrateOutOfRange, Msg: "bitrate must be between 8kbps and 320kbps"}
 	}
 	if format.Channels < 1 || format.Channels > 2 {
-		return errors.New("channels must be 1 (mono) or 2 (stereo)")
+		return &formatError{Code: protocol.CodeChannelsOutOfRange, Msg: "channels must be 1 (mono) or 2 (stereo)"}
 	}
 	if format.SampleRate != 48000 && format.SampleRate != 44100 {
-		return errors.New("sample rate must be 48000Hz or 44100Hz")
+		return &formatError{Code: protocol.CodeSampleRateUnsupported, Msg: "sample rate must be 48000Hz or 44100Hz"}
 	}
-	if format.Codec != "opus" {
-		return errors.New("only opus codec is currently supported")
+	if strings.ToLower(format.Codec) != "opus" {
+		return &formatError{Code: protocol.CodeUnsupportedCodec, Msg: "only opus codec is currently supported"}
 	}
 	return nil
 }
+
+// formatError is a typed error used to signal specific audio format validation failures.
+type formatError struct {
+	Code string
+	Msg  string
+}
+
+func (f *formatError) Error() string { return f.Msg }
 
 // createDefaultCapabilities creates default capabilities based on client type
 func createDefaultCapabilities(clientType string, userAgent string, isWeb bool) types.ClientCapabilities {
@@ -688,6 +699,12 @@ func (cm *ConnectionManager) handleTextMessage(message []byte, expectingAudioDat
 	event.UserID = cm.userID
 	event.Timestamp = time.Now()
 
+	// Handle initial hello handshake from clients
+	if strings.ToLower(event.Type) == "hello" {
+		cm.handleHello(&event)
+		return
+	}
+
 	// Check if this is audio metadata
 	if event.Type == string(types.EventAudioData) {
 		handleAudioMetadata(&event, cm.wsConn, expectingAudioData, audioMetadata, cm.stateManager)
@@ -709,6 +726,202 @@ func (cm *ConnectionManager) handleTextMessage(message []byte, expectingAudioDat
 	} else {
 		handleEvent(cm.stateManager, &event)
 	}
+}
+
+// handleHello processes the initial client hello message which may include
+// clientType, capabilities, preferred format, username, and channel.
+func (cm *ConnectionManager) handleHello(event *types.PTTEvent) {
+	// Delegate negotiation to a pure helper for easier testing
+	res := cm.negotiateHello(event)
+
+	if res.Accepted {
+		if res.UpdatedUser != nil {
+			cm.user = res.UpdatedUser
+		}
+		cm.stateManager.UpdateUser(cm.user)
+	}
+
+	// If accepted, include the negotiated transmit format in the welcome extras
+	extras := res.Extras
+	if res.Accepted {
+		if extras == nil {
+			extras = make(map[string]interface{})
+		}
+		if res.UpdatedUser != nil {
+			extras[protocol.WelcomeKeyNegotiatedTransmitFormat] = res.UpdatedUser.Capabilities.TransmitFormat
+		} else {
+			extras[protocol.WelcomeKeyNegotiatedTransmitFormat] = cm.user.Capabilities.TransmitFormat
+		}
+	}
+
+	sendWelcome(cm.stateManager, cm.userID, cm.user.Channel, res.Accepted, extras)
+}
+
+// helloResult represents the outcome of capability negotiation.
+type helloResult struct {
+	Accepted    bool
+	Reason      string
+	Extras      map[string]interface{}
+	UpdatedUser *types.User
+}
+
+// negotiateHello performs validation and constructs a possibly-updated user object
+// without mutating server state. It returns a helloResult describing acceptance,
+// optional extras (e.g., rejection reason), and the updated user to apply.
+func (cm *ConnectionManager) negotiateHello(event *types.PTTEvent) *helloResult {
+	data := event.Data
+	if data == nil {
+		return &helloResult{Accepted: true, UpdatedUser: cm.user}
+	}
+
+	// Work on a shallow copy to avoid mutating cm.user until accepted
+	userCopy := *cm.user
+
+	// Optional username
+	if uname, ok := data["username"].(string); ok && uname != "" {
+		if isValidUsername(uname) {
+			userCopy.Username = uname
+		} else {
+			extras := map[string]interface{}{"reason": "invalid username", "code": protocol.CodeInvalidUsername}
+			return &helloResult{Accepted: false, Reason: "invalid username", Extras: extras}
+		}
+	}
+
+	// Optional clientType and capabilities
+	if ct, ok := data["clientType"].(string); ok {
+		clientType := ct
+		// Merge provided capabilities if present
+		if caps, ok := data["capabilities"]; ok {
+			capsJSON, err := json.Marshal(caps)
+			if err == nil {
+				var newCaps types.ClientCapabilities
+				if err := json.Unmarshal(capsJSON, &newCaps); err == nil {
+					// Use existing validators which now return typed errors
+						// Normalize first (clamp) then validate the normalized format
+						normTF, _ := normalizeAudioFormat(&userCopy, newCaps.TransmitFormat)
+						if err := validateAudioFormat(&userCopy, normTF); err != nil {
+							if fe, ok := err.(*formatError); ok {
+								extras := map[string]interface{}{"reason": fe.Msg, "code": fe.Code}
+								return &helloResult{Accepted: false, Reason: fe.Msg, Extras: extras}
+							}
+							extras := map[string]interface{}{"reason": err.Error(), "code": "bad_transmit_format"}
+							return &helloResult{Accepted: false, Reason: err.Error(), Extras: extras}
+						}
+						// assign normalized and validated capabilities
+						newCaps.TransmitFormat = normTF
+						userCopy.Capabilities = newCaps
+				}
+			}
+		} else {
+			// No explicit capabilities; create defaults based on clientType and UA
+			userAgent := userCopy.Capabilities.UserAgent
+			_, isWeb := detectClientType(userAgent)
+			userCopy.Capabilities = createDefaultCapabilities(clientType, userAgent, isWeb)
+		}
+	}
+
+	// Optional channel
+	if ch, ok := data["channel"].(string); ok && ch != "" {
+		if isValidChannelName(ch) {
+			userCopy.Channel = ch
+		} else {
+			extras := map[string]interface{}{"reason": "invalid channel", "code": protocol.CodeInvalidChannel}
+			return &helloResult{Accepted: false, Reason: "invalid channel", Extras: extras}
+		}
+	}
+
+	// If capabilities were not provided, normalize defaults; otherwise they were already normalized.
+	extras := map[string]interface{}{}
+	if _, ok := data["capabilities"]; !ok {
+		adjustments := make(map[string]interface{})
+		tf := userCopy.Capabilities.TransmitFormat
+		newTF, adj := normalizeAudioFormat(&userCopy, tf)
+		if adj != nil && len(adj) > 0 {
+			adjustments = adj
+			userCopy.Capabilities.TransmitFormat = newTF
+		}
+		if len(adjustments) > 0 {
+			extras["adjustments"] = adjustments
+		}
+	}
+
+	return &helloResult{Accepted: true, UpdatedUser: &userCopy, Extras: extras}
+}
+
+// normalizeAudioFormat adjusts an audio format to conform to server limits and returns
+// the possibly-modified format along with a map describing adjustments.
+func normalizeAudioFormat(user *types.User, tf types.AudioFormat) (types.AudioFormat, map[string]interface{}) {
+	adjustments := map[string]interface{}{}
+
+	// Clamp bitrate
+	origBR := tf.Bitrate
+	if tf.Bitrate < 8000 {
+		tf.Bitrate = 8000
+	}
+	if tf.Bitrate > 320000 {
+		tf.Bitrate = 320000
+	}
+	if tf.Bitrate != origBR {
+		adjustments["bitrate"] = map[string]int{"from": origBR, "to": tf.Bitrate}
+	}
+
+	// Enforce channels
+	origCh := tf.Channels
+	if tf.Channels < 1 {
+		tf.Channels = 1
+	}
+	if tf.Channels > 2 {
+		tf.Channels = 2
+	}
+	if tf.Channels != origCh {
+		adjustments["channels"] = map[string]int{"from": origCh, "to": tf.Channels}
+	}
+
+	// Normalize sample rate to nearest supported (prefer 48000)
+	origSR := tf.SampleRate
+	if tf.SampleRate != 48000 && tf.SampleRate != 44100 {
+		tf.SampleRate = 48000
+		adjustments["sample_rate"] = map[string]int{"from": origSR, "to": tf.SampleRate}
+	}
+
+	// For web clients, enforce stricter limits (mono, bitrate <= 32000) unless publish-only
+	if user.IsWebClient && !user.PublishOnly {
+		if tf.Bitrate > 32000 {
+			adjustments["web_bitrate_clamped"] = map[string]int{"from": tf.Bitrate, "to": 32000}
+			tf.Bitrate = 32000
+		}
+		if tf.Channels > 1 {
+			adjustments["web_channels_clamped"] = map[string]int{"from": tf.Channels, "to": 1}
+			tf.Channels = 1
+		}
+	}
+
+	if len(adjustments) == 0 {
+		return tf, nil
+	}
+	return tf, adjustments
+}
+
+// sendWelcome sends a welcome ack to the client. extras may include negotiated fields or rejection reason.
+func sendWelcome(stateManager *state.Manager, userID, channel string, accepted bool, extras map[string]interface{}) {
+	data := map[string]interface{}{
+		"accepted":  accepted,
+		"channel":   channel,
+		"sessionId": userID,
+	}
+	if extras != nil {
+		for k, v := range extras {
+			data[k] = v
+		}
+	}
+
+	welcome := &types.PTTEvent{
+		Type:      "welcome",
+		UserID:    userID,
+		Timestamp: time.Now(),
+		Data:      data,
+	}
+	sendMessageToClient(stateManager, userID, welcome)
 }
 
 func (cm *ConnectionManager) handleBinaryMessage(message []byte, expectingAudioData *bool, audioMetadata **types.PTTEvent) {
