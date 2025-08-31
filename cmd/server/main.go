@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"sync"
 	"math"
 	"net/http"
 	"os"
@@ -117,6 +118,11 @@ func init() {
 const (
 	MaxAudioChunkSize = 1024 * 1024 // 1MB limit for audio chunks to prevent memory exhaustion
 )
+
+// MaxOpusPayloadSize is the largest Opus payload size we accept when
+// constructing on-the-wire frames. This prevents attempting to encode a
+// payload length that doesn't fit in a 16-bit length field.
+const MaxOpusPayloadSize = 0xFFFF
 
 // Note: negotiation codes and welcome keys moved to `pkg/protocol`
 
@@ -507,6 +513,8 @@ type ConnectionManager struct {
 	publisherWriter io.WriteCloser
 	publisherCancel context.CancelFunc
 	cid            string
+	// pubMu guards publisherWriter and publisherCancel
+	pubMu sync.Mutex
 }
 
 func (cm *ConnectionManager) initialize() {
@@ -556,7 +564,8 @@ func (cm *ConnectionManager) cleanup() {
 	cm.stateManager.RemoveUser(cm.userID)
 	cm.stateManager.RemoveClient(cm.userID)
 
-	// Stop publisher demux if active
+	// Stop publisher demux if active (guarded by pubMu)
+	cm.pubMu.Lock()
 	if cm.publisherWriter != nil {
 		_ = cm.publisherWriter.Close()
 		cm.publisherWriter = nil
@@ -565,6 +574,7 @@ func (cm *ConnectionManager) cleanup() {
 		cm.publisherCancel()
 		cm.publisherCancel = nil
 	}
+	cm.pubMu.Unlock()
 
 	// Broadcast leave event
 	cm.stateManager.BroadcastEvent(&types.PTTEvent{
@@ -714,10 +724,12 @@ func (cm *ConnectionManager) handleTextMessage(message []byte, expectingAudioDat
 			if v, ok := event.Data["format"].(string); ok && strings.ToLower(v) == "opus" {
 				if cm.publisherWriter == nil {
 					pr, pw := io.Pipe()
+					cm.pubMu.Lock()
 					cm.publisherWriter = pw
-					// spawn demux goroutine
 					ctx, cancel := context.WithCancel(cm.ctx)
 					cm.publisherCancel = cancel
+					cm.pubMu.Unlock()
+					// spawn demux goroutine
 					go cm.server.startPublisherDemux(ctx, cm.user.Channel, pr)
 					zlog.Info().Str("user_id", cm.userID).Str("channel", cm.user.Channel).Msg("started publisher demux")
 				}
@@ -999,14 +1011,19 @@ func (cm *ConnectionManager) handleBinaryMessage(message []byte, expectingAudioD
 	}
 
 	// Handle binary audio data
-	if cm.publisherWriter != nil {
+	cm.pubMu.Lock()
+	pw := cm.publisherWriter
+	cm.pubMu.Unlock()
+	if pw != nil {
 		// write into the publisher pipe for demux
-				if _, err := cm.publisherWriter.Write(message); err != nil {
-					log.Printf("Error writing binary to publisher pipe for user %s: %v", cm.userID, err)
-					// close writer to signal demux EOF
-					_ = cm.publisherWriter.Close()
-					cm.publisherWriter = nil
-				}
+		if _, err := pw.Write(message); err != nil {
+			log.Printf("Error writing binary to publisher pipe for user %s: %v", cm.userID, err)
+			// close writer to signal demux EOF
+			cm.pubMu.Lock()
+			_ = cm.publisherWriter.Close()
+			cm.publisherWriter = nil
+			cm.pubMu.Unlock()
+		}
 		// consume expected metadata flag regardless
 		if *expectingAudioData {
 			*expectingAudioData = false
@@ -1933,7 +1950,7 @@ func (s *Server) buildOpusFrame(seq *uint32, pkt oggdemux.Packet) ([]byte, bool)
 		header[12] = byte(pkt.Channels)
 	}
 	payloadLen := len(pkt.Data)
-	if payloadLen > 0xFFFF {
+	if payloadLen > MaxOpusPayloadSize {
 		return nil, false
 	}
 	binary.BigEndian.PutUint16(header[13:15], uint16(payloadLen))
