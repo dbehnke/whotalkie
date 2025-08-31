@@ -31,71 +31,78 @@ func Init() error {
         return err
     }
 
-    // 1) If OTLP endpoint provided, prefer OTLP/gRPC exporter
+    // Prefer OTLP/gRPC exporter when an endpoint is configured.
     endpoint := os.Getenv("WT_OTEL_OTLP_ENDPOINT")
     if endpoint == "" {
         endpoint = os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
     }
 
     if endpoint != "" {
-        // prepare options
-        opts := []otlptracegrpc.Option{
-            otlptracegrpc.WithEndpoint(endpoint),
-        }
-
-        // allow insecure connections via env
-        insecure := strings.ToLower(os.Getenv("WT_OTEL_OTLP_INSECURE")) == "1" || strings.ToLower(os.Getenv("OTEL_EXPORTER_OTLP_INSECURE")) == "1" || strings.ToLower(os.Getenv("OTEL_EXPORTER_OTLP_INSECURE")) == "true"
-        if insecure {
-            opts = append(opts, otlptracegrpc.WithInsecure())
-        }
-
-        // allow headers from OTEL_EXPORTER_OTLP_HEADERS (comma-separated key=val)
-        if hdrs := os.Getenv("OTEL_EXPORTER_OTLP_HEADERS"); hdrs != "" {
-            m := map[string]string{}
-            for _, pair := range strings.Split(hdrs, ",") {
-                kv := strings.SplitN(pair, "=", 2)
-                if len(kv) == 2 {
-                    m[strings.TrimSpace(kv[0])] = strings.TrimSpace(kv[1])
-                }
-            }
-            if len(m) > 0 {
-                opts = append(opts, otlptracegrpc.WithHeaders(m))
-            }
-        }
-
-        exporter, err := otlptracegrpc.New(ctx, opts...)
-        if err != nil {
-            return err
-        }
-
-        tp = sdktrace.NewTracerProvider(
-            sdktrace.WithBatcher(exporter),
-            sdktrace.WithResource(res),
-        )
-
-        otel.SetTracerProvider(tp)
-        otel.SetTextMapPropagator(propagation.TraceContext{})
-        return nil
+        return initWithOTLP(ctx, res, endpoint)
     }
 
-    // 2) Fallback: stdout exporter when requested
+    // Fallback: stdout exporter when requested
     if strings.ToLower(os.Getenv("WT_OTEL_STDOUT")) == "1" {
-        exporter, err := stdouttrace.New(stdouttrace.WithPrettyPrint())
-        if err != nil {
-            return err
-        }
-
-        tp = sdktrace.NewTracerProvider(
-            sdktrace.WithBatcher(exporter),
-            sdktrace.WithResource(res),
-        )
-
-        otel.SetTracerProvider(tp)
-        otel.SetTextMapPropagator(propagation.TraceContext{})
-        return nil
+        return initWithStdout(ctx, res)
     }
 
     return fmt.Errorf("no OTEL exporter configured: set WT_OTEL_OTLP_ENDPOINT or WT_OTEL_STDOUT=1")
+}
+
+func initWithOTLP(ctx context.Context, res *sdkresource.Resource, endpoint string) error {
+    opts := []otlptracegrpc.Option{
+        otlptracegrpc.WithEndpoint(endpoint),
+    }
+
+    // allow insecure connections via env
+    insecure := strings.ToLower(os.Getenv("WT_OTEL_OTLP_INSECURE")) == "1" || strings.ToLower(os.Getenv("OTEL_EXPORTER_OTLP_INSECURE")) == "1" || strings.ToLower(os.Getenv("OTEL_EXPORTER_OTLP_INSECURE")) == "true"
+    if insecure {
+        opts = append(opts, otlptracegrpc.WithInsecure())
+    }
+
+    // allow headers from OTEL_EXPORTER_OTLP_HEADERS (comma-separated key=val)
+    if hdrs := os.Getenv("OTEL_EXPORTER_OTLP_HEADERS"); hdrs != "" {
+        m := map[string]string{}
+        for _, pair := range strings.Split(hdrs, ",") {
+            kv := strings.SplitN(pair, "=", 2)
+            if len(kv) == 2 {
+                m[strings.TrimSpace(kv[0])] = strings.TrimSpace(kv[1])
+            }
+        }
+        if len(m) > 0 {
+            opts = append(opts, otlptracegrpc.WithHeaders(m))
+        }
+    }
+
+    exporter, err := otlptracegrpc.New(ctx, opts...)
+    if err != nil {
+        return err
+    }
+
+    tp = sdktrace.NewTracerProvider(
+        sdktrace.WithBatcher(exporter),
+        sdktrace.WithResource(res),
+    )
+
+    otel.SetTracerProvider(tp)
+    otel.SetTextMapPropagator(propagation.TraceContext{})
+    return nil
+}
+
+func initWithStdout(ctx context.Context, res *sdkresource.Resource) error {
+    exporter, err := stdouttrace.New(stdouttrace.WithPrettyPrint())
+    if err != nil {
+        return err
+    }
+
+    tp = sdktrace.NewTracerProvider(
+        sdktrace.WithBatcher(exporter),
+        sdktrace.WithResource(res),
+    )
+
+    otel.SetTracerProvider(tp)
+    otel.SetTextMapPropagator(propagation.TraceContext{})
+    return nil
 }
 
 // Flush gracefully shuts down the tracer provider, flushing any pending spans.
