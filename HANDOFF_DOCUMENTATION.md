@@ -276,6 +276,7 @@ whotalkie-stream [OPTIONS]
 - [x] All critical bugs resolved
 - [x] Code committed to version control
 - [x] Documentation updated
+- [x] Repository coding-agent guidance added (`.copilot-instructions.md`) — run `golangci-lint` before PRs; when sharing shell commands prefer `bash -lc '...'` so snippets run under bash even if the default shell is Fish
 
 ### Phase 3: Next Session Goals 🎯
 - [ ] **Merge current feature branch PR** (`feature/core-ptt-system` → main)
