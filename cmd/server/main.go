@@ -128,7 +128,7 @@ const MaxOpusPayloadSize = 0xFFFF
 
 // Ping/Pong supervision settings. Tests override these for speed.
 var PingInterval = 20 * time.Second
-var PongTimeout = 40 * time.Second
+var PongTimeout = 90 * time.Second
 var PingWriteTimeout = 5 * time.Second
 // How many consecutive ping write failures will be tolerated before closing
 var PingFailureThreshold int32 = 3
@@ -1517,7 +1517,9 @@ func handleHeartbeat(stateManager *state.Manager, event *types.PTTEvent) {
 	// server's ping supervisor treats app heartbeats as evidence of
 	// liveness (useful when intermediaries drop control frames).
 	if client, ok := stateManager.GetClient(event.UserID); ok && client != nil && client.LastAppHeartbeat != nil {
-		atomic.StoreInt64(client.LastAppHeartbeat, time.Now().UnixNano())
+	now := time.Now().UnixNano()
+	atomic.StoreInt64(client.LastAppHeartbeat, now)
+	zlog.Debug().Str("user_id", event.UserID).Msg("Received application heartbeat")
 	}
 
 	response := &types.PTTEvent{
