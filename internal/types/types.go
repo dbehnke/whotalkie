@@ -83,6 +83,11 @@ type WebSocketConnection struct {
 	Conn   *websocket.Conn
 	UserID string
 	Send   chan []byte
+	// LastAppHeartbeat points to a unix-nanoseconds timestamp updated when the
+	// client sends an application-level heartbeat event. It's optional and
+	// used by the server to consider application heartbeats as evidence of
+	// liveness when control-frame pongs may be lost by intermediaries.
+	LastAppHeartbeat *int64
 }
 
 type ServerState struct {

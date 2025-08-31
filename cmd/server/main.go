@@ -486,7 +486,9 @@ func (s *Server) handleWebSocket(c *gin.Context) {
 	wsConn := &types.WebSocketConnection{
 		Conn:   conn,
 		UserID: userID,
-		Send:   make(chan []byte, 256),
+		// Larger send buffer reduces chances of transient 'send channel full'
+		// situations causing the server to mark clients as failed.
+		Send:   make(chan []byte, 1024),
 	}
 
 	// Enhanced connection lifecycle management
@@ -503,11 +505,21 @@ func (s *Server) handleWebSocket(c *gin.Context) {
 		cid:          cid,
 		// lastPong pointer will be set just below so pingLoop can observe it
 		lastPong:     nil,
+		// lastAppHeartbeat will be set below and used as an alternative
+		// liveness signal when application-level heartbeats are received.
+		lastAppHeartbeat: nil,
 	}
 
 	// Attach the lastPong pointer used by AcceptOptions so the connection's
 	// OnPongReceived callback updates the same location the pingLoop watches.
 	connectionManager.lastPong = &lastPong
+
+	// Initialize an app-heartbeat timestamp and wire it both into the
+	// connection manager and the WebSocketConnection so handleHeartbeat can
+	// update it via the state manager's client lookup.
+	lastApp := time.Now().UnixNano()
+	connectionManager.lastAppHeartbeat = &lastApp
+	wsConn.LastAppHeartbeat = connectionManager.lastAppHeartbeat
 
 	connectionManager.initialize()
 	defer connectionManager.cleanup()
@@ -538,6 +550,10 @@ type ConnectionManager struct {
 	pubMu sync.Mutex
 	// lastPong points to unix nanoseconds of the last pong received (nil if not set)
 	lastPong *int64
+	// lastAppHeartbeat points to the unix-nanoseconds timestamp of the
+	// last application-level heartbeat received from this client. It's
+	// optional and used as an additional liveness signal.
+	lastAppHeartbeat *int64
 	// pingFailures counts consecutive ping write failures
 	pingFailures int32
 }
@@ -696,21 +712,40 @@ func (cm *ConnectionManager) pingLoop() {
 			}
 			cancel()
 
-			// Check last pong time if available
-			if cm.lastPong != nil {
-				last := time.Unix(0, atomic.LoadInt64(cm.lastPong))
-				if time.Since(last) > PongTimeout {
-					z := zlog.Warn().Str("user_id", cm.userID).Dur("since_last_pong", time.Since(last))
+			if lastSeen, ok := cm.lastSeenTime(); ok {
+				if time.Since(lastSeen) > PongTimeout {
+					z := zlog.Warn().Str("user_id", cm.userID).Dur("since_last_seen", time.Since(lastSeen))
 					if cm.cid != "" {
 						z = z.Str("cid", cm.cid)
 					}
-					z.Msg("No recent pong; closing connection")
+					z.Msg("No recent pong or heartbeat; closing connection")
 					cm.cancel()
 					return
 				}
 			}
 		}
 	}
+}
+
+// lastSeenTime returns the most recent time seen from transport pongs or
+// application-level heartbeats and a boolean indicating whether a value was
+// found.
+func (cm *ConnectionManager) lastSeenTime() (time.Time, bool) {
+	var lastSeen time.Time
+	var have bool
+	if cm.lastPong != nil {
+		last := time.Unix(0, atomic.LoadInt64(cm.lastPong))
+		lastSeen = last
+		have = true
+	}
+	if cm.lastAppHeartbeat != nil {
+		lastApp := time.Unix(0, atomic.LoadInt64(cm.lastAppHeartbeat))
+		if !have || lastApp.After(lastSeen) {
+			lastSeen = lastApp
+			have = true
+		}
+	}
+	return lastSeen, have
 }
 
 // detectMessageType inspects the message bytes and returns an appropriate
@@ -1478,6 +1513,13 @@ func handleHeartbeat(stateManager *state.Manager, event *types.PTTEvent) {
 		return
 	}
 
+	// Update client's app-level heartbeat timestamp if present so the
+	// server's ping supervisor treats app heartbeats as evidence of
+	// liveness (useful when intermediaries drop control frames).
+	if client, ok := stateManager.GetClient(event.UserID); ok && client != nil && client.LastAppHeartbeat != nil {
+		atomic.StoreInt64(client.LastAppHeartbeat, time.Now().UnixNano())
+	}
+
 	response := &types.PTTEvent{
 		Type:      string(types.EventHeartbeat),
 		UserID:    event.UserID,
@@ -1582,7 +1624,7 @@ func (s *Server) broadcastEvents() {
 
 // broadcastToClients handles broadcasting to all clients with failure tracking
 func (s *Server) broadcastToClients(eventBytes []byte, clientFailures map[string]int) {
-	const maxConsecutiveFailures = 5 // Clean up after 5 consecutive failures
+	const maxConsecutiveFailures = 10 // Be more tolerant to transient failures
 
 	clients := s.stateManager.GetAllClients()
 	var clientsToRemove []string
