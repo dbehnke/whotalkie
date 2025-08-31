@@ -739,6 +739,14 @@ func (cm *ConnectionManager) handleHello(event *types.PTTEvent) {
 			cm.user = res.UpdatedUser
 		}
 		cm.stateManager.UpdateUser(cm.user)
+		// If the hello included a channel, ensure the user is joined into that channel
+		if cm.user.Channel != "" {
+			// Ensure channel exists (create if needed) before joining
+			cm.stateManager.GetOrCreateChannel(cm.user.Channel, cm.user.Channel)
+			if err := cm.stateManager.JoinChannel(cm.userID, cm.user.Channel); err != nil {
+				zlog.Warn().Err(err).Str("user_id", cm.userID).Str("channel", cm.user.Channel).Msg("failed to auto-join user to channel from hello")
+			}
+		}
 	}
 
 	// If accepted, include the negotiated transmit format in the welcome extras
@@ -778,74 +786,110 @@ func (cm *ConnectionManager) negotiateHello(event *types.PTTEvent) *helloResult 
 	userCopy := *cm.user
 
 	// Optional username
-	if uname, ok := data["username"].(string); ok && uname != "" {
-		if isValidUsername(uname) {
-			userCopy.Username = uname
-		} else {
-			extras := map[string]interface{}{"reason": "invalid username", "code": protocol.CodeInvalidUsername}
-			return &helloResult{Accepted: false, Reason: "invalid username", Extras: extras}
+	if err := applyUsernameFromData(&userCopy, data); err != nil {
+		if fe, ok := err.(*formatError); ok {
+			extras := map[string]interface{}{"reason": fe.Msg, "code": fe.Code}
+			return &helloResult{Accepted: false, Reason: fe.Msg, Extras: extras}
 		}
+		extras := map[string]interface{}{"reason": err.Error(), "code": "invalid_username"}
+		return &helloResult{Accepted: false, Reason: err.Error(), Extras: extras}
 	}
 
 	// Optional clientType and capabilities
-	if ct, ok := data["clientType"].(string); ok {
-		clientType := ct
-		// Merge provided capabilities if present
-		if caps, ok := data["capabilities"]; ok {
-			capsJSON, err := json.Marshal(caps)
-			if err == nil {
-				var newCaps types.ClientCapabilities
-				if err := json.Unmarshal(capsJSON, &newCaps); err == nil {
-					// Use existing validators which now return typed errors
-						// Normalize first (clamp) then validate the normalized format
-						normTF, _ := normalizeAudioFormat(&userCopy, newCaps.TransmitFormat)
-						if err := validateAudioFormat(&userCopy, normTF); err != nil {
-							if fe, ok := err.(*formatError); ok {
-								extras := map[string]interface{}{"reason": fe.Msg, "code": fe.Code}
-								return &helloResult{Accepted: false, Reason: fe.Msg, Extras: extras}
-							}
-							extras := map[string]interface{}{"reason": err.Error(), "code": "bad_transmit_format"}
-							return &helloResult{Accepted: false, Reason: err.Error(), Extras: extras}
-						}
-						// assign normalized and validated capabilities
-						newCaps.TransmitFormat = normTF
-						userCopy.Capabilities = newCaps
-				}
-			}
-		} else {
-			// No explicit capabilities; create defaults based on clientType and UA
-			userAgent := userCopy.Capabilities.UserAgent
-			_, isWeb := detectClientType(userAgent)
-			userCopy.Capabilities = createDefaultCapabilities(clientType, userAgent, isWeb)
+	if err := cm.applyClientTypeFromData(&userCopy, data); err != nil {
+		if fe, ok := err.(*formatError); ok {
+			extras := map[string]interface{}{"reason": fe.Msg, "code": fe.Code}
+			return &helloResult{Accepted: false, Reason: fe.Msg, Extras: extras}
 		}
+		extras := map[string]interface{}{"reason": err.Error(), "code": "bad_transmit_format"}
+		return &helloResult{Accepted: false, Reason: err.Error(), Extras: extras}
 	}
 
 	// Optional channel
-	if ch, ok := data["channel"].(string); ok && ch != "" {
-		if isValidChannelName(ch) {
-			userCopy.Channel = ch
-		} else {
-			extras := map[string]interface{}{"reason": "invalid channel", "code": protocol.CodeInvalidChannel}
-			return &helloResult{Accepted: false, Reason: "invalid channel", Extras: extras}
+	if err := applyChannelFromData(&userCopy, data); err != nil {
+		if fe, ok := err.(*formatError); ok {
+			extras := map[string]interface{}{"reason": fe.Msg, "code": fe.Code}
+			return &helloResult{Accepted: false, Reason: fe.Msg, Extras: extras}
 		}
+		extras := map[string]interface{}{"reason": err.Error(), "code": "invalid_channel"}
+		return &helloResult{Accepted: false, Reason: err.Error(), Extras: extras}
 	}
 
 	// If capabilities were not provided, normalize defaults; otherwise they were already normalized.
 	extras := map[string]interface{}{}
 	if _, ok := data["capabilities"]; !ok {
-		adjustments := make(map[string]interface{})
 		tf := userCopy.Capabilities.TransmitFormat
 		newTF, adj := normalizeAudioFormat(&userCopy, tf)
-		if adj != nil && len(adj) > 0 {
-			adjustments = adj
+		if len(adj) > 0 {
 			userCopy.Capabilities.TransmitFormat = newTF
-		}
-		if len(adjustments) > 0 {
-			extras["adjustments"] = adjustments
+			extras["adjustments"] = adj
 		}
 	}
 
 	return &helloResult{Accepted: true, UpdatedUser: &userCopy, Extras: extras}
+}
+
+// applyProvidedCapabilities decodes provided capabilities, normalizes the transmit
+// format, validates it, and assigns it into userCopy.
+func (cm *ConnectionManager) applyProvidedCapabilities(userCopy *types.User, caps interface{}) error {
+	capsJSON, err := json.Marshal(caps)
+	if err != nil {
+		return err
+	}
+	var newCaps types.ClientCapabilities
+	if err := json.Unmarshal(capsJSON, &newCaps); err != nil {
+		return err
+	}
+	// Normalize then validate the transmit format
+	normTF, _ := normalizeAudioFormat(userCopy, newCaps.TransmitFormat)
+	if err := validateAudioFormat(userCopy, normTF); err != nil {
+		return err
+	}
+	newCaps.TransmitFormat = normTF
+	userCopy.Capabilities = newCaps
+	return nil
+}
+
+// applyUsernameFromData sets username on userCopy if provided and valid.
+func applyUsernameFromData(userCopy *types.User, data map[string]interface{}) error {
+	if uname, ok := data["username"].(string); ok && uname != "" {
+		if !isValidUsername(uname) {
+			return &formatError{Code: protocol.CodeInvalidUsername, Msg: "invalid username"}
+		}
+		userCopy.Username = uname
+	}
+	return nil
+}
+
+// applyChannelFromData sets channel on userCopy if provided and valid.
+func applyChannelFromData(userCopy *types.User, data map[string]interface{}) error {
+	if ch, ok := data["channel"].(string); ok && ch != "" {
+		if !isValidChannelName(ch) {
+			return &formatError{Code: protocol.CodeInvalidChannel, Msg: "invalid channel"}
+		}
+		userCopy.Channel = ch
+	}
+	return nil
+}
+
+// applyClientTypeFromData handles optional clientType and capabilities fields.
+func (cm *ConnectionManager) applyClientTypeFromData(userCopy *types.User, data map[string]interface{}) error {
+	ct, ok := data["clientType"].(string)
+	if !ok {
+		return nil
+	}
+	clientType := ct
+	if caps, ok := data["capabilities"]; ok {
+		if err := cm.applyProvidedCapabilities(userCopy, caps); err != nil {
+			return err
+		}
+	} else {
+		// No explicit capabilities; create defaults based on clientType and UA
+		userAgent := userCopy.Capabilities.UserAgent
+		_, isWeb := detectClientType(userAgent)
+		userCopy.Capabilities = createDefaultCapabilities(clientType, userAgent, isWeb)
+	}
+	return nil
 }
 
 // normalizeAudioFormat adjusts an audio format to conform to server limits and returns
@@ -853,46 +897,34 @@ func (cm *ConnectionManager) negotiateHello(event *types.PTTEvent) *helloResult 
 func normalizeAudioFormat(user *types.User, tf types.AudioFormat) (types.AudioFormat, map[string]interface{}) {
 	adjustments := map[string]interface{}{}
 
-	// Clamp bitrate
-	origBR := tf.Bitrate
-	if tf.Bitrate < 8000 {
-		tf.Bitrate = 8000
-	}
-	if tf.Bitrate > 320000 {
-		tf.Bitrate = 320000
-	}
-	if tf.Bitrate != origBR {
-		adjustments["bitrate"] = map[string]int{"from": origBR, "to": tf.Bitrate}
+	tf, adj := clampBitrate(tf)
+	if len(adj) > 0 {
+		adjustments["bitrate"] = adj
 	}
 
-	// Enforce channels
-	origCh := tf.Channels
-	if tf.Channels < 1 {
-		tf.Channels = 1
-	}
-	if tf.Channels > 2 {
-		tf.Channels = 2
-	}
-	if tf.Channels != origCh {
-		adjustments["channels"] = map[string]int{"from": origCh, "to": tf.Channels}
+	tf, adj = clampChannels(tf)
+	if len(adj) > 0 {
+		adjustments["channels"] = adj
 	}
 
-	// Normalize sample rate to nearest supported (prefer 48000)
-	origSR := tf.SampleRate
-	if tf.SampleRate != 48000 && tf.SampleRate != 44100 {
-		tf.SampleRate = 48000
-		adjustments["sample_rate"] = map[string]int{"from": origSR, "to": tf.SampleRate}
+	tf, adj = normalizeSampleRate(tf)
+	if len(adj) > 0 {
+		adjustments["sample_rate"] = adj
 	}
 
 	// For web clients, enforce stricter limits (mono, bitrate <= 32000) unless publish-only
 	if user.IsWebClient && !user.PublishOnly {
+		webAdj := map[string]interface{}{}
 		if tf.Bitrate > 32000 {
-			adjustments["web_bitrate_clamped"] = map[string]int{"from": tf.Bitrate, "to": 32000}
+			webAdj["web_bitrate_clamped"] = map[string]int{"from": tf.Bitrate, "to": 32000}
 			tf.Bitrate = 32000
 		}
 		if tf.Channels > 1 {
-			adjustments["web_channels_clamped"] = map[string]int{"from": tf.Channels, "to": 1}
+			webAdj["web_channels_clamped"] = map[string]int{"from": tf.Channels, "to": 1}
 			tf.Channels = 1
+		}
+		for k, v := range webAdj {
+			adjustments[k] = v
 		}
 	}
 
@@ -902,6 +934,43 @@ func normalizeAudioFormat(user *types.User, tf types.AudioFormat) (types.AudioFo
 	return tf, adjustments
 }
 
+func clampBitrate(tf types.AudioFormat) (types.AudioFormat, map[string]int) {
+	origBR := tf.Bitrate
+	if tf.Bitrate < 8000 {
+		tf.Bitrate = 8000
+	}
+	if tf.Bitrate > 320000 {
+		tf.Bitrate = 320000
+	}
+	if tf.Bitrate != origBR {
+		return tf, map[string]int{"from": origBR, "to": tf.Bitrate}
+	}
+	return tf, nil
+}
+
+func clampChannels(tf types.AudioFormat) (types.AudioFormat, map[string]int) {
+	origCh := tf.Channels
+	if tf.Channels < 1 {
+		tf.Channels = 1
+	}
+	if tf.Channels > 2 {
+		tf.Channels = 2
+	}
+	if tf.Channels != origCh {
+		return tf, map[string]int{"from": origCh, "to": tf.Channels}
+	}
+	return tf, nil
+}
+
+func normalizeSampleRate(tf types.AudioFormat) (types.AudioFormat, map[string]int) {
+	origSR := tf.SampleRate
+	if tf.SampleRate != 48000 && tf.SampleRate != 44100 {
+		tf.SampleRate = 48000
+		return tf, map[string]int{"from": origSR, "to": tf.SampleRate}
+	}
+	return tf, nil
+}
+
 // sendWelcome sends a welcome ack to the client. extras may include negotiated fields or rejection reason.
 func sendWelcome(stateManager *state.Manager, userID, channel string, accepted bool, extras map[string]interface{}) {
 	data := map[string]interface{}{
@@ -909,10 +978,8 @@ func sendWelcome(stateManager *state.Manager, userID, channel string, accepted b
 		"channel":   channel,
 		"sessionId": userID,
 	}
-	if extras != nil {
-		for k, v := range extras {
-			data[k] = v
-		}
+	for k, v := range extras {
+		data[k] = v
 	}
 
 	welcome := &types.PTTEvent{

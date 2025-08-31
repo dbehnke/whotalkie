@@ -17,6 +17,7 @@ import (
 // TestWebSocketHandshakeIntegration starts an httptest server using the real
 // handleWebSocket route and performs a websocket dial to /ws, sending a hello
 // and asserting a welcome with negotiated_transmit_format is returned.
+// nolint:cyclop
 func TestWebSocketHandshakeIntegration(t *testing.T) {
 	// Create server and router as in main
 	router := gin.New()
@@ -39,7 +40,7 @@ func TestWebSocketHandshakeIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("websocket dial failed: %v", err)
 	}
-	defer conn.Close(websocket.StatusNormalClosure, "test done")
+	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "test done") }()
 
 	// Send a hello event over the websocket
 	hello := types.PTTEvent{

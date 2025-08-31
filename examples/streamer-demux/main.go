@@ -31,7 +31,7 @@ func main() {
 	if err := sc.Connect(ctx); err != nil {
 		log.Fatalf("connect: %v", err)
 	}
-	defer sc.Disconnect()
+	defer func() { _ = sc.Disconnect() }()
 
 	if err := sc.NegotiateCapabilities(ctx); err != nil {
 		log.Fatalf("negotiate: %v", err)
@@ -50,7 +50,7 @@ func main() {
 		fmt.Println("sample file not found; example will exit")
 		return
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	err = demuxAndStream(ctx, sc, f)
 	if err != nil && err != io.EOF {
@@ -58,7 +58,10 @@ func main() {
 	}
 
 	// signal stop
-	sc.StopTransmission(ctx)
+	if err := sc.StopTransmission(ctx); err != nil {
+		// Best-effort stop; log and continue
+		log.Printf("StopTransmission error: %v", err)
+	}
 }
 
 // demuxAndStream is a placeholder. Replace this with actual demuxing logic.
