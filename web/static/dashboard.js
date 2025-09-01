@@ -951,7 +951,6 @@ async function playReceivedAudio(audioData, userID = 'unknown', metadata) {
             }
 
             // Populate format/sample_rate defaults if missing
-                        // debug logs removed: avoid referencing local decoder variables in header parsing scope
             if (metadata && metadata.data) {
                 if (!metadata.data.format) metadata.data.format = 'opus';
                 if (!metadata.data.sample_rate) metadata.data.sample_rate = 48000;
