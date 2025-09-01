@@ -1933,57 +1933,80 @@ func (s *Server) startPublisherDemux(ctx context.Context, channelID string, r io
 func (s *Server) spawnPublisherWriter(ctx context.Context, channelID string, r io.Reader, pw *io.PipeWriter, buf *stream.Buffer) {
 	go func() {
 		tracer := otel.Tracer("whotalkie/server.publisher")
-		// create a short-lived span for the writer lifecycle
-	cid := cidpkg.CIDFromContext(ctx)
-		attrs := []attribute.KeyValue{}
-		if cid != "" {
-			attrs = append(attrs, attribute.String(cidpkg.AttributeName, cid))
-		}
-		_, wspan := tracer.Start(ctx, fmt.Sprintf("publisher.writer %s", channelID), trace.WithAttributes(attrs...), trace.WithSpanKind(trace.SpanKindInternal))
+		_, wspan := s.createPublisherSpan(ctx, tracer, channelID)
 		defer wspan.End()
 		defer func() {
 			_ = pw.Close()
 			zlog.Info().Str("channel", channelID).Msg("publisher pipe writer closed")
 		}()
-		tmp := make([]byte, 32*1024)
-		wroteFirst := false
-		for {
-			n, err := r.Read(tmp)
-			if n > 0 {
-				if !wroteFirst {
-					s.handlePublisherFirstWrite(channelID, tmp[:n])
-					wroteFirst = true
-				}
-				if DebugAudio {
-					log.Printf("PUBLISHER WRITE READ: channel=%s read=%d bytes", channelID, n)
-				}
+		
+		s.runPublisherLoop(ctx, channelID, r, pw, buf, wspan)
+	}()
+}
 
-				if _, werr := buf.WriteWithTimeout(tmp[:n], 100*time.Millisecond); werr != nil {
-					zlog.Warn().Str("channel", channelID).Err(werr).Msg("publisher buffer write timeout")
-				}
-				if _, werr := pw.Write(tmp[:n]); werr != nil {
-					z := zlog.Error().Str("channel", channelID).Err(werr)
-					if DebugAudio {
-						log.Printf("PUBLISHER WRITE PIPE ERROR: channel=%s write_err=%v", channelID, werr)
-					}
-				if cid := cidpkg.CIDFromContext(ctx); cid != "" {
-						z = z.Str("cid", cid)
-					}
-					z.Msg("publisher pipe write error")
-					// record error in span
-					wspan.RecordError(werr)
-					wspan.SetStatus(codes.Error, werr.Error())
-					return
-				}
+func (s *Server) createPublisherSpan(ctx context.Context, tracer trace.Tracer, channelID string) (context.Context, trace.Span) {
+	cid := cidpkg.CIDFromContext(ctx)
+	attrs := []attribute.KeyValue{}
+	if cid != "" {
+		attrs = append(attrs, attribute.String(cidpkg.AttributeName, cid))
+	}
+	return tracer.Start(ctx, fmt.Sprintf("publisher.writer %s", channelID), trace.WithAttributes(attrs...), trace.WithSpanKind(trace.SpanKindInternal))
+}
+
+func (s *Server) runPublisherLoop(ctx context.Context, channelID string, r io.Reader, pw *io.PipeWriter, buf *stream.Buffer, wspan trace.Span) {
+	tmp := make([]byte, 32*1024)
+	wroteFirst := false
+	for {
+		n, err := r.Read(tmp)
+		if n > 0 {
+			if !wroteFirst {
+				s.handlePublisherFirstWrite(channelID, tmp[:n])
+				wroteFirst = true
 			}
-			if err != nil {
-				if err != io.EOF {
-					log.Printf("publisher read error for %s: %v", channelID, err)
-				}
+			if s.handlePublisherData(ctx, channelID, tmp[:n], pw, buf, wspan) {
 				return
 			}
 		}
-	}()
+		if err != nil {
+			s.handlePublisherReadError(channelID, err)
+			return
+		}
+	}
+}
+
+func (s *Server) handlePublisherData(ctx context.Context, channelID string, data []byte, pw *io.PipeWriter, buf *stream.Buffer, wspan trace.Span) bool {
+	if DebugAudio {
+		log.Printf("PUBLISHER WRITE READ: channel=%s read=%d bytes", channelID, len(data))
+	}
+
+	if _, werr := buf.WriteWithTimeout(data, 100*time.Millisecond); werr != nil {
+		zlog.Warn().Str("channel", channelID).Err(werr).Msg("publisher buffer write timeout")
+	}
+	
+	if _, werr := pw.Write(data); werr != nil {
+		s.logPublisherWriteError(ctx, channelID, werr)
+		wspan.RecordError(werr)
+		wspan.SetStatus(codes.Error, werr.Error())
+		return true
+	}
+	return false
+}
+
+func (s *Server) logPublisherWriteError(ctx context.Context, channelID string, werr error) {
+	z := zlog.Error().Str("channel", channelID).Err(werr)
+	if DebugAudio {
+		log.Printf("PUBLISHER WRITE PIPE ERROR: channel=%s write_err=%v", channelID, werr)
+	}
+	if cid := cidpkg.CIDFromContext(ctx); cid != "" {
+		z = z.Str("cid", cid)
+	}
+	z.Msg("publisher pipe write error")
+}
+
+func (s *Server) handlePublisherReadError(channelID string, err error) {
+	if err != io.EOF {
+		log.Printf("publisher read error for %s: %v", channelID, err)
+	}
 }
 
 // handlePublisherFirstWrite logs the initial incoming bytes and saves a small
@@ -2172,59 +2195,120 @@ func (s *Server) emitOpusPacket(channelID string, seq *uint32, pkt oggdemux.Pack
 func (s *Server) buildOpusFrame(channelID string, seq *uint32, pkt oggdemux.Packet) ([]byte, bool) {
 	header := make([]byte, 15)
 	binary.BigEndian.PutUint32(header[0:4], *seq)
-	var ts uint64
-	if pkt.GranulePos != 0 {
-		// Candidate timestamp derived from granule position
-		candidate := (pkt.GranulePos * 1000000) / 48000
-		s.lastTsMu.Lock()
-		last := s.lastTsPerChannel[channelID]
-		bumped := false
-		if last == 0 {
-			// initialize to candidate if first
-			ts = candidate
-		} else {
-			if candidate <= last {
-				// granule pos didn't advance per-packet; bump by 20ms
-				last = last + 20000
-				ts = last
-				bumped = true
-			} else {
-				ts = candidate
-			}
-		}
-		s.lastTsPerChannel[channelID] = ts
-		s.lastTsMu.Unlock()
-		if DebugAudio {
-			log.Printf("AUDIO TS: channel=%s granule=%d candidate=%d chosen=%d last=%d bumped=%v", channelID, pkt.GranulePos, candidate, ts, last, bumped)
-		}
-	} else {
-		// Fallback: use lastTsPerChannel + estimated frame duration (20ms)
-		s.lastTsMu.Lock()
-		last := s.lastTsPerChannel[channelID]
-		if last == 0 {
-			// initialize to current wall-clock microseconds
-			last = uint64(time.Now().UnixNano() / 1000)
-		}
-		last += 20000 // 20ms
-		ts = last
-		s.lastTsPerChannel[channelID] = last
-		s.lastTsMu.Unlock()
-		if DebugAudio {
-			log.Printf("AUDIO TS: channel=%s granule=0 candidate=0 chosen=%d fallback=true", channelID, last)
-		}
-	}
+	
+	ts := s.calculateTimestamp(channelID, pkt)
 	binary.BigEndian.PutUint64(header[4:12], ts)
-	if pkt.Channels == 0 {
-		header[12] = 1
-	} else {
-		header[12] = byte(pkt.Channels)
-	}
-	payloadLen := len(pkt.Data)
-	if payloadLen > MaxOpusPayloadSize {
+	
+	s.setChannelCount(header, s.safeUint8(pkt.Channels))
+	
+	if !s.validatePayloadSize(pkt.Data) {
 		return nil, false
 	}
-	binary.BigEndian.PutUint16(header[13:15], uint16(payloadLen))
+	
+	binary.BigEndian.PutUint16(header[13:15], s.safeUint16(len(pkt.Data)))
 	return append(header, pkt.Data...), true
+}
+
+func (s *Server) calculateTimestamp(channelID string, pkt oggdemux.Packet) uint64 {
+	if pkt.GranulePos != 0 {
+		return s.calculateTimestampFromGranule(channelID, pkt.GranulePos)
+	}
+	return s.calculateFallbackTimestamp(channelID)
+}
+
+func (s *Server) calculateTimestampFromGranule(channelID string, granulePos uint64) uint64 {
+	candidate := (granulePos * 1000000) / 48000
+	s.lastTsMu.Lock()
+	defer s.lastTsMu.Unlock()
+	
+	last := s.lastTsPerChannel[channelID]
+	bumped := false
+	var ts uint64
+	
+	if last == 0 {
+		ts = candidate
+	} else {
+		ts, bumped = s.adjustTimestampForDuplicateGranule(candidate, last)
+	}
+	
+	s.lastTsPerChannel[channelID] = ts
+	s.logTimestampDebug(channelID, granulePos, candidate, ts, last, bumped)
+	return ts
+}
+
+func (s *Server) adjustTimestampForDuplicateGranule(candidate, last uint64) (uint64, bool) {
+	if candidate <= last {
+		return last + 20000, true // bump by 20ms
+	}
+	return candidate, false
+}
+
+func (s *Server) calculateFallbackTimestamp(channelID string) uint64 {
+	s.lastTsMu.Lock()
+	defer s.lastTsMu.Unlock()
+	
+	last := s.lastTsPerChannel[channelID]
+	if last == 0 {
+		last = s.getCurrentWallClockMicros()
+	}
+	last += 20000 // 20ms
+	
+	s.lastTsPerChannel[channelID] = last
+	s.logFallbackTimestamp(channelID, last)
+	return last
+}
+
+func (s *Server) getCurrentWallClockMicros() uint64 {
+	now := time.Now().UnixNano()
+	if now < 0 {
+		now = 0
+	}
+	nowMicros := now / 1000
+	if nowMicros < 0 {
+		nowMicros = 0
+	}
+	if nowMicros > 0 {
+		return uint64(nowMicros)
+	}
+	return 0
+}
+
+func (s *Server) logTimestampDebug(channelID string, granulePos, candidate, ts, last uint64, bumped bool) {
+	if DebugAudio {
+		log.Printf("AUDIO TS: channel=%s granule=%d candidate=%d chosen=%d last=%d bumped=%v", channelID, granulePos, candidate, ts, last, bumped)
+	}
+}
+
+func (s *Server) logFallbackTimestamp(channelID string, ts uint64) {
+	if DebugAudio {
+		log.Printf("AUDIO TS: channel=%s granule=0 candidate=0 chosen=%d fallback=true", channelID, ts)
+	}
+}
+
+func (s *Server) setChannelCount(header []byte, channels uint8) {
+	if channels == 0 {
+		header[12] = 1
+	} else {
+		header[12] = byte(channels)
+	}
+}
+
+func (s *Server) validatePayloadSize(data []byte) bool {
+	return len(data) <= MaxOpusPayloadSize
+}
+
+func (s *Server) safeUint8(val int) uint8 {
+	if val < 0 || val > 255 {
+		return 0
+	}
+	return uint8(val)
+}
+
+func (s *Server) safeUint16(val int) uint16 {
+	if val < 0 || val > 65535 {
+		return 0
+	}
+	return uint16(val)
 }
 
 // (removed unused debug helper)
@@ -2235,64 +2319,104 @@ func (s *Server) sendOpusToChannel(channelID string, metadata *types.PTTEvent, m
 		return
 	}
 	metadataBytes, _ := json.Marshal(metadata)
+	
 	for _, chUser := range channel.Users {
-		if chUser.PublishOnly {
+		if s.shouldSkipUser(&chUser) {
 			continue
 		}
+		
 		client, exists := s.stateManager.GetClient(chUser.ID)
 		if !exists {
 			continue
 		}
+		
 		s.logOutgoingBinaryFirstBytes(msg)
-		// Dedupe by sequence number per-channel to avoid re-broadcasting duplicates
-		if len(msg) >= 15 {
-			seq := binary.BigEndian.Uint32(msg[0:4])
-			// Prune old entries and check existence
-			now := time.Now()
-			s.recentSeqsMu.Lock()
-			m, ok := s.recentSeqs[channelID]
-			if !ok {
-				m = make(map[uint32]time.Time)
-				s.recentSeqs[channelID] = m
-			}
-			// Remove entries older than 5s
-			for k, v := range m {
-				if now.Sub(v) > 5*time.Second {
-					delete(m, k)
-				}
-			}
-			// If seq already seen, skip sending
-			if _, seen := m[seq]; seen {
-				if DebugAudio {
-					log.Printf("AUDIO OUT SKIP duplicate -> user=%s seq=%d channel=%s", chUser.ID, seq, channelID)
-				}
-				s.recentSeqsMu.Unlock()
-				continue
-			}
-			// record seq
-			m[seq] = now
-			s.recentSeqsMu.Unlock()
+		
+		if s.shouldSkipDuplicateMessage(channelID, chUser.ID, msg, metadata) {
+			continue
+		}
+		
+		s.sendDataToClient(client, metadataBytes, msg)
+	}
+}
 
-			// If DebugAudio enabled, parse and log the 15-byte header fields
-			if DebugAudio {
-				ts := binary.BigEndian.Uint64(msg[4:12])
-				channels := uint8(msg[12])
-				payloadLen := binary.BigEndian.Uint16(msg[13:15])
-				comments := ""
-				if c, ok := metadata.Data["comments"].(string); ok {
-					comments = c
-				}
-				log.Printf("AUDIO OUT -> user=%s seq=%d ts_us=%d channels=%d payload_len=%d meta=%s", chUser.ID, seq, ts, channels, payloadLen, comments)
-			}
+func (s *Server) shouldSkipUser(chUser *types.User) bool {
+	return chUser.PublishOnly
+}
+
+func (s *Server) shouldSkipDuplicateMessage(channelID, userID string, msg []byte, metadata *types.PTTEvent) bool {
+	if len(msg) < 15 {
+		return false
+	}
+	
+	seq := binary.BigEndian.Uint32(msg[0:4])
+	now := time.Now()
+	
+	s.recentSeqsMu.Lock()
+	defer s.recentSeqsMu.Unlock()
+	
+	m := s.getOrCreateSeqMap(channelID)
+	s.pruneOldSeqEntries(m, now)
+	
+	if s.isSeqAlreadySeen(m, seq, userID, channelID) {
+		return true
+	}
+	
+	m[seq] = now
+	s.logAudioOut(userID, seq, msg, metadata)
+	return false
+}
+
+func (s *Server) getOrCreateSeqMap(channelID string) map[uint32]time.Time {
+	m, ok := s.recentSeqs[channelID]
+	if !ok {
+		m = make(map[uint32]time.Time)
+		s.recentSeqs[channelID] = m
+	}
+	return m
+}
+
+func (s *Server) pruneOldSeqEntries(m map[uint32]time.Time, now time.Time) {
+	for k, v := range m {
+		if now.Sub(v) > 5*time.Second {
+			delete(m, k)
 		}
-		select {
-		case client.Send <- metadataBytes:
-		default:
+	}
+}
+
+func (s *Server) isSeqAlreadySeen(m map[uint32]time.Time, seq uint32, userID, channelID string) bool {
+	if _, seen := m[seq]; seen {
+		if DebugAudio {
+			log.Printf("AUDIO OUT SKIP duplicate -> user=%s seq=%d channel=%s", userID, seq, channelID)
 		}
-		select {
-		case client.Send <- msg:
-		default:
-		}
+		return true
+	}
+	return false
+}
+
+func (s *Server) logAudioOut(userID string, seq uint32, msg []byte, metadata *types.PTTEvent) {
+	if !DebugAudio {
+		return
+	}
+	
+	ts := binary.BigEndian.Uint64(msg[4:12])
+	channels := uint8(msg[12])
+	payloadLen := binary.BigEndian.Uint16(msg[13:15])
+	comments := ""
+	if c, ok := metadata.Data["comments"].(string); ok {
+		comments = c
+	}
+	log.Printf("AUDIO OUT -> user=%s seq=%d ts_us=%d channels=%d payload_len=%d meta=%s", userID, seq, ts, channels, payloadLen, comments)
+}
+
+func (s *Server) sendDataToClient(client *types.WebSocketConnection, metadataBytes, msg []byte) {
+	select {
+	case client.Send <- metadataBytes:
+	default:
+	}
+	select {
+	case client.Send <- msg:
+	default:
 	}
 }
 

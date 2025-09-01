@@ -171,6 +171,22 @@ func runStreaming(cfg runConfig) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	setupShutdownHandler(cancel)
+	
+	if err := streamClient.ConnectAndSetup(ctx); err != nil {
+		log.Fatalf("❌ Failed to connect and setup: %v", err)
+	}
+	defer func() { _ = streamClient.Disconnect() }()
+
+	startMessageListener(ctx, streamClient)
+	startMetaSender(ctx, cfg.Meta, streamClient)
+	
+	runStreamingMode(ctx, cfg, streamClient)
+	
+	time.Sleep(500 * time.Millisecond)
+}
+
+func setupShutdownHandler(cancel context.CancelFunc) {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -178,12 +194,9 @@ func runStreaming(cfg runConfig) {
 		log.Printf("🛑 Shutting down...")
 		cancel()
 	}()
+}
 
-	if err := streamClient.ConnectAndSetup(ctx); err != nil {
-		log.Fatalf("❌ Failed to connect and setup: %v", err)
-	}
-	defer func() { _ = streamClient.Disconnect() }()
-
+func startMessageListener(ctx context.Context, streamClient *client.StreamingClient) {
 	go func() {
 		if err := streamClient.ListenForMessages(ctx); err != nil {
 			if ctx.Err() == nil {
@@ -191,61 +204,62 @@ func runStreaming(cfg runConfig) {
 			}
 		}
 	}()
+}
 
-	// If a meta string was provided, send it once and then every 30s while
-	// streaming so viewers receive periodic updates.
-	if cfg.Meta != "" {
-		go func() {
-			// send immediately
-			_ = streamClient.SendMeta(ctx, cfg.Meta)
-			ticker := time.NewTicker(30 * time.Second)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					_ = streamClient.SendMeta(ctx, cfg.Meta)
-				}
-			}
-		}()
+func startMetaSender(ctx context.Context, meta string, streamClient *client.StreamingClient) {
+	if meta == "" {
+		return
 	}
-
-	if cfg.Stdin {
-		log.Printf("🎤 Streaming from stdin (pipe ffmpeg output here)...")
-		log.Printf("💡 Example: ffmpeg -i https://stream.zeno.fm/vgchxkqc998uv -f ogg -c:a libopus -b:a %dk -ac %d - | %s", cfg.Client.Bitrate/1000, cfg.Client.Channels, os.Args[0])
-		if err := streamClient.StreamFromReader(ctx, os.Stdin, cfg.ChunkSize); err != nil {
-			if ctx.Err() == context.Canceled {
-				log.Printf("⏹️ Stream cancelled by user")
-			} else {
-				log.Printf("❌ Stream error: %v", err)
+	
+	go func() {
+		_ = streamClient.SendMeta(ctx, meta)
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				_ = streamClient.SendMeta(ctx, meta)
 			}
-		} else {
-			log.Printf("✅ Stream completed successfully")
 		}
+	}()
+}
+
+func runStreamingMode(ctx context.Context, cfg runConfig, streamClient *client.StreamingClient) {
+	if cfg.Stdin {
+		runStdinStreaming(ctx, cfg, streamClient)
 	} else if cfg.Duration == 0 {
-		log.Printf("🎤 Starting infinite test stream (Ctrl+C to stop)...")
-		if err := streamClient.StreamInfinite(ctx, cfg.Interval, cfg.ChunkSize); err != nil {
-			if ctx.Err() == context.Canceled {
-				log.Printf("⏹️ Stream cancelled by user")
-			} else {
-				log.Printf("❌ Stream error: %v", err)
-			}
+		runInfiniteStreaming(ctx, cfg, streamClient)
+	} else {
+		runDurationStreaming(ctx, cfg, streamClient)
+	}
+}
+
+func runStdinStreaming(ctx context.Context, cfg runConfig, streamClient *client.StreamingClient) {
+	log.Printf("🎤 Streaming from stdin (pipe ffmpeg output here)...")
+	log.Printf("💡 Example: ffmpeg -i https://stream.zeno.fm/vgchxkqc998uv -f ogg -c:a libopus -b:a %dk -ac %d - | %s", cfg.Client.Bitrate/1000, cfg.Client.Channels, os.Args[0])
+	handleStreamError(streamClient.StreamFromReader(ctx, os.Stdin, cfg.ChunkSize), ctx)
+}
+
+func runInfiniteStreaming(ctx context.Context, cfg runConfig, streamClient *client.StreamingClient) {
+	log.Printf("🎤 Starting infinite test stream (Ctrl+C to stop)...")
+	handleStreamError(streamClient.StreamInfinite(ctx, cfg.Interval, cfg.ChunkSize), ctx)
+}
+
+func runDurationStreaming(ctx context.Context, cfg runConfig, streamClient *client.StreamingClient) {
+	log.Printf("🎤 Starting test stream for %s...", cfg.Duration)
+	handleStreamError(streamClient.StreamForDuration(ctx, cfg.Duration, cfg.Interval, cfg.ChunkSize), ctx)
+}
+
+func handleStreamError(err error, ctx context.Context) {
+	if err != nil {
+		if ctx.Err() == context.Canceled {
+			log.Printf("⏹️ Stream cancelled by user")
 		} else {
-			log.Printf("✅ Stream completed successfully")
+			log.Printf("❌ Stream error: %v", err)
 		}
 	} else {
-		log.Printf("🎤 Starting test stream for %s...", cfg.Duration)
-		if err := streamClient.StreamForDuration(ctx, cfg.Duration, cfg.Interval, cfg.ChunkSize); err != nil {
-			if ctx.Err() == context.Canceled {
-				log.Printf("⏹️ Stream cancelled by user")
-			} else {
-				log.Printf("❌ Stream error: %v", err)
-			}
-		} else {
-			log.Printf("✅ Stream completed successfully")
-		}
+		log.Printf("✅ Stream completed successfully")
 	}
-
-	time.Sleep(500 * time.Millisecond)
 }

@@ -44,14 +44,29 @@ func makeOpusTagsPacket(title string) []byte {
     b.WriteString("OpusTags")
     // vendor
     vendor := "go-test"
-    binary.Write(&b, binary.LittleEndian, uint32(len(vendor)))
+    vendorLen := len(vendor)
+    if vendorLen < 0 || vendorLen > 0xFFFFFFFF {
+        vendorLen = 0
+    }
+    _ = binary.Write(&b, binary.LittleEndian, safeUint32(vendorLen))
     b.WriteString(vendor)
     // list length: 1 comment
-    binary.Write(&b, binary.LittleEndian, uint32(1))
+    _ = binary.Write(&b, binary.LittleEndian, uint32(1))
     comment := "TITLE=" + title
-    binary.Write(&b, binary.LittleEndian, uint32(len(comment)))
+    commentLen := len(comment)
+    if commentLen < 0 || commentLen > 0xFFFFFFFF {
+        commentLen = 0
+    }
+    _ = binary.Write(&b, binary.LittleEndian, safeUint32(commentLen))
     b.WriteString(comment)
     return b.Bytes()
+}
+
+func safeUint32(val int) uint32 {
+    if val < 0 || val > 0xFFFFFFFF {
+        return 0
+    }
+    return uint32(val)
 }
 
 // helper to wrap a packet into a minimal Ogg page (single segment)
