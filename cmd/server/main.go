@@ -2526,6 +2526,56 @@ func main() {
 func (s *Server) Start() {
 	// Start event broadcasting goroutine
 	go s.broadcastEvents()
+	// Start background pruning for recentSeqs to avoid unbounded growth.
+	go s.startRecentSeqsPruner()
+}
+
+// startRecentSeqsPruner runs a background goroutine that periodically prunes
+// old sequence entries from s.recentSeqs. TTL and interval are configurable
+// via RECENT_SEQ_TTL_SECONDS and RECENT_SEQ_PRUNE_INTERVAL_SECONDS env vars.
+func (s *Server) startRecentSeqsPruner() {
+	// defaults (seconds parsed below)
+	var ttl time.Duration
+	var interval time.Duration
+
+	ttlSecs := parseEnvSeconds("RECENT_SEQ_TTL_SECONDS", 5)
+	intervalSecs := parseEnvSeconds("RECENT_SEQ_PRUNE_INTERVAL_SECONDS", 5)
+	ttl = time.Duration(ttlSecs) * time.Second
+	interval = time.Duration(intervalSecs) * time.Second
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case now := <-ticker.C:
+			s.recentSeqsMu.Lock()
+			for ch, m := range s.recentSeqs {
+				for seq, ts := range m {
+					if now.Sub(ts) > ttl {
+						delete(m, seq)
+					}
+				}
+				// remove empty channel map to free memory
+				if len(m) == 0 {
+					delete(s.recentSeqs, ch)
+				}
+			}
+			s.recentSeqsMu.Unlock()
+		}
+	}
+}
+
+// parseEnvSeconds parses an environment variable as integer seconds and
+// returns default if unset or invalid.
+func parseEnvSeconds(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if iv, err := strconv.Atoi(v); err == nil && iv > 0 {
+			return iv
+		}
+	}
+	return def
 }
 
 // Run starts the HTTP server with graceful shutdown
