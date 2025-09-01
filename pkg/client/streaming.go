@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"errors"
 	"strings"
 	"time"
 	"log"
@@ -175,19 +176,43 @@ func (c *StreamingClient) StreamFromReader(ctx context.Context, reader io.Reader
 }
 
 func (c *StreamingClient) startDemuxerForMeta(ctx context.Context, pr *io.PipeReader) {
-	demux := oggdemux.New(pr)
-	
+	// Run demuxer loop in a goroutine. On non-EOF errors the demuxer will
+	// log and retry with backoff so metadata extraction continues when
+	// transient parse/read errors occur. If the pipe reader is closed or EOF
+	// is reached, the goroutine will exit.
 	go func() {
 		var lastTitle string
+		backoff := time.Second
 		for {
-			page, err := demux.NextPage()
-			if err != nil {
-				return
+			demux := oggdemux.New(pr)
+			for {
+				page, err := demux.NextPage()
+				if err != nil {
+					if errors.Is(err, io.EOF) {
+						// clean end of stream
+						log.Printf("demuxer: EOF, stopping metadata goroutine")
+						return
+					}
+					log.Printf("demuxer: error reading page: %v; will retry", err)
+					break // break inner loop -> recreate demux and retry after backoff
+				}
+				if page == nil {
+					continue
+				}
+				c.processPageForMeta(ctx, page, &lastTitle)
 			}
-			if page == nil {
+
+			// wait before retrying; exit early if context cancelled
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+				// exponential backoff capped at 30s
+				if backoff < 30*time.Second {
+					backoff *= 2
+				}
 				continue
 			}
-			c.processPageForMeta(ctx, page, &lastTitle)
 		}
 	}()
 }
