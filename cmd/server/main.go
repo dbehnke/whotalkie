@@ -2450,8 +2450,13 @@ func (s *Server) handleChannels(c *gin.Context) {
 // handleDebugAudio returns a small JSON object containing lastTsPerChannel and
 // per-channel recent seq counts for debugging timestamp/dedupe behavior.
 func (s *Server) handleDebugAudio(c *gin.Context) {
-	// Require debug API key if configured
+	// Require debug API key; if not configured the endpoint is disabled
 	if err := s.requireDebugAPIKey(c); err != nil {
+		if errors.Is(err, ErrDebugDisabled) {
+			// Hide the endpoint when disabled
+			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+			return
+		}
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
 		return
 	}
@@ -2481,8 +2486,8 @@ func (s *Server) handleDebugAudio(c *gin.Context) {
 func (s *Server) requireDebugAPIKey(c *gin.Context) error {
 	key := os.Getenv("DEBUG_API_KEY")
 	if key == "" {
-		// No key configured -> allow access (useful for local/dev)
-		return nil
+		// Endpoint disabled unless DEBUG_API_KEY is explicitly set
+		return ErrDebugDisabled
 	}
 	provided := c.GetHeader("X-API-Key")
 	if provided == "" {
@@ -2493,6 +2498,10 @@ func (s *Server) requireDebugAPIKey(c *gin.Context) error {
 	}
 	return nil
 }
+
+// ErrDebugDisabled is returned when the debug endpoints are intentionally
+// disabled by not setting DEBUG_API_KEY.
+var ErrDebugDisabled = fmt.Errorf("debug endpoint disabled")
 
 func main() {
 	server := NewServer()
