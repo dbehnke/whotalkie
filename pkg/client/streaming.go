@@ -217,6 +217,7 @@ func (c *StreamingClient) getSendValue(title string, data []byte) string {
 }
 
 func (c *StreamingClient) streamLoop(ctx context.Context, bufReader *bufio.Reader, buffer []byte, pw *io.PipeWriter) error {
+	defer pw.Close()
 	for {
 		select {
 		case <-ctx.Done():
