@@ -234,6 +234,16 @@ func (m *Manager) GetOrCreateChannel(channelID, name string) *types.Channel {
 	return channel
 }
 
+// SetChannelMeta stores stream metadata/comments (e.g., Vorbis comments) on the channel.
+// This is used by the server to persist and periodically re-broadcast metadata for listeners.
+func (m *Manager) SetChannelMeta(channelID string, comments string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if ch, ok := m.channels[channelID]; ok {
+		ch.Description = comments
+	}
+}
+
 func (m *Manager) GetAllChannels() []*types.Channel {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

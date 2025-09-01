@@ -213,6 +213,23 @@ func (c *StreamClient) SendAudioData(ctx context.Context, audioData []byte) erro
 	return nil
 }
 
+// SendMeta sends a `meta` event (e.g., Vorbis comments) to the server for the
+// current channel. This can be used by streamers to update stream title/metadata.
+func (c *StreamClient) SendMeta(ctx context.Context, comments string) error {
+	event := PTTEvent{
+		Type:      "meta",
+		Timestamp: time.Now(),
+		Data: map[string]interface{}{
+			"comments": comments,
+		},
+	}
+
+	if err := c.sendEvent(ctx, event); err != nil {
+		return fmt.Errorf("failed to send meta event: %w", err)
+	}
+	return nil
+}
+
 // StopTransmission stops PTT transmission
 func (c *StreamClient) StopTransmission(ctx context.Context) error {
 	event := PTTEvent{

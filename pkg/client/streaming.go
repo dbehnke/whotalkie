@@ -2,10 +2,15 @@ package client
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
+	"strings"
 	"time"
+
+	"whotalkie/internal/oggdemux"
 )
 
 // StreamingClient extends StreamClient with convenient streaming utilities
@@ -130,6 +135,28 @@ func (c *StreamingClient) StreamForDuration(ctx context.Context, duration time.D
 	}
 }
 
+// StreamInfinite streams test audio indefinitely until context is cancelled
+func (c *StreamingClient) StreamInfinite(ctx context.Context, interval time.Duration, chunkSize int) error {
+	if err := c.StartStreaming(ctx); err != nil {
+		return err
+	}
+	defer func() { _ = c.StopStreaming(ctx) }()
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if err := c.SendTestAudio(ctx, chunkSize); err != nil {
+				return fmt.Errorf("error sending test audio: %w", err)
+			}
+		}
+	}
+}
+
 // StreamFromReader streams audio data from an io.Reader (e.g., stdin)
 func (c *StreamingClient) StreamFromReader(ctx context.Context, reader io.Reader, chunkSize int) error {
 	if err := c.StartStreaming(ctx); err != nil {
@@ -142,6 +169,44 @@ func (c *StreamingClient) StreamFromReader(ctx context.Context, reader io.Reader
 	// pipeline which expects OGG bytes when publish-only is used with stdin.
 	bufReader := bufio.NewReader(reader)
 	buffer := make([]byte, chunkSize)
+
+	// Create a pipe so we can run a local demuxer concurrently to detect
+	// Vorbis comments (OpusTags) and send meta events from the streamer.
+	// We write every chunk into the pipeWriter and the demuxer reads from
+	// the pipeReader via oggdemux.New(pipeReader).
+	pr, pw := io.Pipe()
+	demux := oggdemux.New(pr)
+
+	// demux goroutine: emits SendMeta when the TITLE (Vorbis comment) changes
+	go func() {
+		var lastTitle string
+		for {
+			page, err := demux.NextPage()
+			if err != nil {
+				// EOF or other errors end demux loop
+				return
+			}
+			if page == nil {
+				continue
+			}
+			for _, pkt := range page.Packets {
+				if pkt.IsVorbisComment {
+					title := parseOpusTagsTitle(pkt.Data)
+					var sendVal string
+					if title != "" {
+						sendVal = title
+					} else {
+						// fallback to raw comments if no TITLE found
+						sendVal = string(pkt.Data)
+					}
+					if sendVal != lastTitle {
+						lastTitle = sendVal
+						_ = c.SendMeta(ctx, sendVal)
+					}
+				}
+			}
+		}
+	}()
 
 	for {
 		select {
@@ -157,6 +222,11 @@ func (c *StreamingClient) StreamFromReader(ctx context.Context, reader io.Reader
 			}
 
 			if n > 0 {
+				// Write into demux pipe (best-effort). If the demux goroutine
+				// has exited, this may return an error — ignore it and continue
+				// sending to the server.
+				_, _ = pw.Write(buffer[:n])
+
 				// Send raw chunk bytes (container data) to server. Server will
 				// write these into its demux pipe and parse OGG pages itself.
 				if err := c.SendOpusData(ctx, buffer[:n]); err != nil {
@@ -165,4 +235,55 @@ func (c *StreamingClient) StreamFromReader(ctx context.Context, reader io.Reader
 			}
 		}
 	}
+}
+
+// parseOpusTagsTitle parses an OpusTags packet (Vorbis comments) and
+// returns the first TITLE comment value it finds (case-insensitive), or
+// empty string if none present.
+func parseOpusTagsTitle(data []byte) string {
+	// Need at least 8 bytes for "OpusTags" + 4 bytes vendor len + 4 bytes list len
+	if len(data) < 16 {
+		return ""
+	}
+	if string(data[0:8]) != "OpusTags" {
+		return ""
+	}
+	r := bytes.NewReader(data[8:])
+	var vendorLen uint32
+	if err := binary.Read(r, binary.LittleEndian, &vendorLen); err != nil {
+		return ""
+	}
+	// skip vendor string
+	if int(vendorLen) > r.Len() {
+		return ""
+	}
+	if _, err := r.Seek(int64(vendorLen), io.SeekCurrent); err != nil {
+		return ""
+	}
+	var listLen uint32
+	if err := binary.Read(r, binary.LittleEndian, &listLen); err != nil {
+		return ""
+	}
+	for i := uint32(0); i < listLen; i++ {
+		var clen uint32
+		if err := binary.Read(r, binary.LittleEndian, &clen); err != nil {
+			return ""
+		}
+		if int(clen) > r.Len() {
+			return ""
+		}
+		buf := make([]byte, clen)
+		if _, err := io.ReadFull(r, buf); err != nil {
+			return ""
+		}
+		// comment is KEY=VALUE
+		s := string(buf)
+		parts := strings.SplitN(s, "=", 2)
+		if len(parts) == 2 {
+			if strings.EqualFold(strings.TrimSpace(parts[0]), "TITLE") {
+				return strings.TrimSpace(parts[1])
+			}
+		}
+	}
+	return ""
 }

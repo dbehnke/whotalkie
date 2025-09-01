@@ -89,17 +89,19 @@ type runConfig struct {
 	ChunkSize int
 	Stdin bool
 	Verbose bool
+	Meta string
 }
 
 func parseFlags() runConfig {
 	var (
+	meta        = flag.String("meta", "", "Optional stream metadata/comments to send (e.g., title)")
 		serverURL   = flag.String("server", "ws://localhost:8080/ws", "WhoTalkie server WebSocket URL")
 		username    = flag.String("username", "", "Username for the stream client (required)")
 		channel     = flag.String("channel", "general", "Channel to join")
 		bitrate     = flag.Int("bitrate", 64000, "Audio bitrate in bps (32000, 64000, 128000)")
 		stereo      = flag.Bool("stereo", true, "Use stereo audio (2 channels)")
 		publishOnly = flag.Bool("publish-only", true, "Connect as publish-only client")
-		duration    = flag.Int("duration", 10, "Test transmission duration in seconds")
+		duration    = flag.Int("duration", 0, "Test transmission duration in seconds (0 = infinite)")
 		interval    = flag.Int("interval", 1000, "Audio chunk interval in milliseconds")
 		chunkSize   = flag.Int("chunk-size", 1024, "Audio chunk size in bytes")
 		verbose     = flag.Bool("verbose", false, "Enable verbose logging")
@@ -137,6 +139,9 @@ func parseFlags() runConfig {
 	log.Printf("   Audio: %dkbps, %s", *bitrate/1000, map[bool]string{true: "stereo", false: "mono"}[*stereo])
 	log.Printf("   Publish-only: %v", *publishOnly)
 	log.Printf("   Duration: %ds", *duration)
+	if *meta != "" {
+		log.Printf("   Meta: %s", *meta)
+	}
 
 	return runConfig{
 		Client: client.ClientConfig{
@@ -153,6 +158,7 @@ func parseFlags() runConfig {
 		ChunkSize: *chunkSize,
 		Stdin: *stdin,
 		Verbose: *verbose,
+	Meta: *meta,
 	}
 }
 
@@ -186,10 +192,40 @@ func runStreaming(cfg runConfig) {
 		}
 	}()
 
+	// If a meta string was provided, send it once and then every 30s while
+	// streaming so viewers receive periodic updates.
+	if cfg.Meta != "" {
+		go func() {
+			// send immediately
+			_ = streamClient.SendMeta(ctx, cfg.Meta)
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					_ = streamClient.SendMeta(ctx, cfg.Meta)
+				}
+			}
+		}()
+	}
+
 	if cfg.Stdin {
 		log.Printf("🎤 Streaming from stdin (pipe ffmpeg output here)...")
 		log.Printf("💡 Example: ffmpeg -i https://stream.zeno.fm/vgchxkqc998uv -f ogg -c:a libopus -b:a %dk -ac %d - | %s", cfg.Client.Bitrate/1000, cfg.Client.Channels, os.Args[0])
 		if err := streamClient.StreamFromReader(ctx, os.Stdin, cfg.ChunkSize); err != nil {
+			if ctx.Err() == context.Canceled {
+				log.Printf("⏹️ Stream cancelled by user")
+			} else {
+				log.Printf("❌ Stream error: %v", err)
+			}
+		} else {
+			log.Printf("✅ Stream completed successfully")
+		}
+	} else if cfg.Duration == 0 {
+		log.Printf("🎤 Starting infinite test stream (Ctrl+C to stop)...")
+		if err := streamClient.StreamInfinite(ctx, cfg.Interval, cfg.ChunkSize); err != nil {
 			if ctx.Err() == context.Canceled {
 				log.Printf("⏹️ Stream cancelled by user")
 			} else {
