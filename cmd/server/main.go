@@ -2450,6 +2450,11 @@ func (s *Server) handleChannels(c *gin.Context) {
 // handleDebugAudio returns a small JSON object containing lastTsPerChannel and
 // per-channel recent seq counts for debugging timestamp/dedupe behavior.
 func (s *Server) handleDebugAudio(c *gin.Context) {
+	// Require debug API key if configured
+	if err := s.requireDebugAPIKey(c); err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
 	s.lastTsMu.Lock()
 	lastCopy := make(map[string]uint64, len(s.lastTsPerChannel))
 	for k, v := range s.lastTsPerChannel {
@@ -2468,6 +2473,25 @@ func (s *Server) handleDebugAudio(c *gin.Context) {
 		"last_ts_per_channel": lastCopy,
 		"recent_seq_counts":  seqCounts,
 	})
+}
+
+// requireDebugAPIKey checks the DEBUG_API_KEY environment variable. If the
+// variable is empty, the endpoint is considered disabled/open. If set, the
+// client must provide the same value in the X-API-Key header.
+func (s *Server) requireDebugAPIKey(c *gin.Context) error {
+	key := os.Getenv("DEBUG_API_KEY")
+	if key == "" {
+		// No key configured -> allow access (useful for local/dev)
+		return nil
+	}
+	provided := c.GetHeader("X-API-Key")
+	if provided == "" {
+		return fmt.Errorf("missing api key")
+	}
+	if provided != key {
+		return fmt.Errorf("invalid api key")
+	}
+	return nil
 }
 
 func main() {
