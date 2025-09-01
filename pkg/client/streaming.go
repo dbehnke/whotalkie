@@ -9,6 +9,7 @@ import (
 	"io"
 	"strings"
 	"time"
+	"log"
 
 	"whotalkie/internal/oggdemux"
 )
@@ -217,7 +218,12 @@ func (c *StreamingClient) getSendValue(title string, data []byte) string {
 }
 
 func (c *StreamingClient) streamLoop(ctx context.Context, bufReader *bufio.Reader, buffer []byte, pw *io.PipeWriter) error {
-	defer pw.Close()
+	defer func() {
+		if err := pw.Close(); err != nil {
+			// best-effort log; streaming is ending anyway
+			log.Printf("failed to close demux pipe writer: %v", err)
+		}
+	}()
 	for {
 		select {
 		case <-ctx.Done():
