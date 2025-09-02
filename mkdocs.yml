@@ -1,0 +1,10 @@
+site_name: WhoTalkie Documentation
+site_description: Documentation for the WhoTalkie PTT streaming project
+nav:
+  - Home: index.md
+  - Protocol: opus-protocol.md
+  - Ops: ops.md
+theme:
+  name: material
+plugins:
+  - search
