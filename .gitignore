@@ -60,3 +60,15 @@ coverage.html
 # Built binaries
 whotalkie
 whotalkie-*
+
+# Python / MkDocs
+.venv/
+site/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+pip-wheel-metadata/
+/.mypy_cache/
+/.pytest_cache/
