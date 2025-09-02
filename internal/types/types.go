@@ -129,4 +129,6 @@ type ServerStats struct {
 	DroppedCriticalEvents int `json:"dropped_critical_events"`
 	EventBufferLength     int `json:"event_buffer_length"`
 	EventBufferCapacity   int `json:"event_buffer_capacity"`
+	MetaWorkerCount       int `json:"meta_worker_count"`
+	MetaDroppedEvents     int `json:"meta_dropped_events"`
 }

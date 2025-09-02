@@ -14,16 +14,20 @@ import (
 )
 
 type Manager struct {
-	mu                    sync.RWMutex
-	users                 map[string]*types.User
-	channels              map[string]*types.Channel
-	clients               map[string]*types.WebSocketConnection
-	events                chan *types.PTTEvent
+	mu       sync.RWMutex
+	users    map[string]*types.User
+	channels map[string]*types.Channel
+	clients  map[string]*types.WebSocketConnection
+	events   chan *types.PTTEvent
 	// metaJobs is a bounded queue of metadata events processed by a fixed
 	// worker pool to avoid unbounded goroutine creation when many meta
 	// broadcasts occur.
-	metaJobs              chan *types.PTTEvent
-	metaWG                sync.WaitGroup
+	metaJobs chan *types.PTTEvent
+	metaWG   sync.WaitGroup
+	// metaWorkerCount tracks currently active meta workers. Protected by mu.
+	metaWorkerCount int
+	// metaDroppedEvents counts how many meta events were dropped due to full queue.
+	metaDroppedEvents int
 	// streamBuffers holds per-channel live Ogg raw stream buffers for HTTP proxying
 	streamBuffers         map[string]*stream.Buffer
 	droppedCriticalEvents int  // Track dropped critical events for monitoring
@@ -41,11 +45,11 @@ const (
 
 func NewManager() *Manager {
 	return &Manager{
-		users:    make(map[string]*types.User),
-		channels: make(map[string]*types.Channel),
-		clients:  make(map[string]*types.WebSocketConnection),
-	events:   make(chan *types.PTTEvent, DefaultEventBufferSize),
-	streamBuffers: make(map[string]*stream.Buffer),
+		users:         make(map[string]*types.User),
+		channels:      make(map[string]*types.Channel),
+		clients:       make(map[string]*types.WebSocketConnection),
+		events:        make(chan *types.PTTEvent, DefaultEventBufferSize),
+		streamBuffers: make(map[string]*stream.Buffer),
 	}
 }
 
@@ -59,11 +63,11 @@ func NewManagerWithBufferSize(bufferSize int) *Manager {
 	}
 
 	return &Manager{
-		users:    make(map[string]*types.User),
-		channels: make(map[string]*types.Channel),
-		clients:  make(map[string]*types.WebSocketConnection),
-	events:   make(chan *types.PTTEvent, bufferSize),
-	streamBuffers: make(map[string]*stream.Buffer),
+		users:         make(map[string]*types.User),
+		channels:      make(map[string]*types.Channel),
+		clients:       make(map[string]*types.WebSocketConnection),
+		events:        make(chan *types.PTTEvent, bufferSize),
+		streamBuffers: make(map[string]*stream.Buffer),
 	}
 }
 
@@ -82,6 +86,8 @@ func (m *Manager) StartMetaWorkerPool(ctx context.Context) {
 	queueSize := getEnvIntOrDefault("META_BROADCAST_QUEUE_SIZE", DefaultMetaQueueSize)
 
 	m.metaJobs = make(chan *types.PTTEvent, queueSize)
+	// record the expected worker count for observability
+	m.metaWorkerCount = workers
 	m.mu.Unlock()
 
 	// Start worker goroutines
@@ -105,7 +111,15 @@ func getEnvIntOrDefault(key string, def int) int {
 // runMetaWorker is the loop executed by each meta worker goroutine. Separated
 // out to reduce cyclomatic complexity in StartMetaWorkerPool.
 func (m *Manager) runMetaWorker(ctx context.Context) {
-	defer m.metaWG.Done()
+	defer func() {
+		// decrement active worker counter
+		m.mu.Lock()
+		if m.metaWorkerCount > 0 {
+			m.metaWorkerCount--
+		}
+		m.mu.Unlock()
+		m.metaWG.Done()
+	}()
 	for {
 		select {
 		case <-ctx.Done():
@@ -135,14 +149,28 @@ func (m *Manager) EnqueueMeta(event *types.PTTEvent) bool {
 	case metaJobs <- event:
 		return true
 	default:
-		// Drop on overflow to protect the system; track as a dropped critical
-		// event for visibility (re-using the counter).
+		// Drop on overflow to protect the system; track as a dropped meta
+		// event for visibility.
 		m.mu.Lock()
-		m.droppedCriticalEvents++
+		m.metaDroppedEvents++
 		m.mu.Unlock()
 		log.Printf("WARNING: meta enqueue dropped due to full queue")
 		return false
 	}
+}
+
+// MetaWorkerCount returns the currently active number of meta workers.
+func (m *Manager) MetaWorkerCount() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.metaWorkerCount
+}
+
+// MetaDropped returns the number of meta events dropped due to queue overflow.
+func (m *Manager) MetaDropped() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.metaDroppedEvents
 }
 
 // GetOrCreateStreamBuffer returns an existing buffer for the channel or creates one.
@@ -153,7 +181,7 @@ func (m *Manager) GetOrCreateStreamBuffer(channelID string) *stream.Buffer {
 		return b
 	}
 	// default buffer size 1MB
-	b := stream.NewBuffer(1<<20)
+	b := stream.NewBuffer(1 << 20)
 	m.streamBuffers[channelID] = b
 	return b
 }
@@ -175,7 +203,6 @@ func (m *Manager) CloseStreamBuffer(channelID string) {
 		delete(m.streamBuffers, channelID)
 	}
 }
-
 
 func (m *Manager) AddUser(user *types.User) {
 	m.mu.Lock()
@@ -529,6 +556,8 @@ func (m *Manager) GetStats() types.ServerStats {
 		DroppedCriticalEvents: m.droppedCriticalEvents,
 		EventBufferLength:     eventBufferLen,
 		EventBufferCapacity:   eventBufferCap,
+		MetaWorkerCount:       m.metaWorkerCount,
+		MetaDroppedEvents:     m.metaDroppedEvents,
 	}
 }
 
