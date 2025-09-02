@@ -1,8 +1,7 @@
 name: Deploy MkDocs to GitHub Pages
 
 on:
-  push:
-    branches: [ main ]
+  workflow_dispatch: {}
 
 jobs:
   deploy:
@@ -12,10 +11,10 @@ jobs:
       - uses: actions/setup-python@v4
         with:
           python-version: '3.x'
-      - name: Install MkDocs and theme
+      - name: Install requirements
         run: |
           python -m pip install --upgrade pip
-          pip install mkdocs-material
+          pip install -r requirements.txt
       - name: Build site
         run: mkdocs build --site-dir site
       - name: Deploy to GitHub Pages
