@@ -534,24 +534,48 @@ func (m *Manager) GetStats() types.ServerStats {
 
 // Shutdown gracefully closes the event channel and cleans up resources
 func (m *Manager) Shutdown() {
+	// First, mark we're shutting down and take ownership of the metaJobs
+	// channel so we can close it and wait for workers without holding the
+	// manager lock (workers may call BroadcastEvent which acquires locks).
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	// Check if we're already shutting down to prevent race conditions
 	if m.isShuttingDown {
+		m.mu.Unlock()
 		log.Printf("Shutdown already in progress, ignoring duplicate call")
 		return
 	}
-
-	// Set shutdown flag first
 	m.isShuttingDown = true
 
+	// Steal the metaJobs channel reference so we can close it without holding
+	// the lock and avoid races with EnqueueMeta (which checks isShuttingDown).
+	var metaJobs chan *types.PTTEvent
+	if m.metaJobs != nil {
+		metaJobs = m.metaJobs
+		m.metaJobs = nil
+	}
+	m.mu.Unlock()
+
+	// Close metaJobs and wait for workers to exit. Do this before closing the
+	// primary events channel because workers call BroadcastEvent which will
+	// attempt to send into m.events; closing m.events first would cause a
+	// panic in the workers.
+	if metaJobs != nil {
+		close(metaJobs)
+		m.metaWG.Wait()
+	}
+
+	// Now acquire lock to close remaining resources and the events channel.
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	// Close event channel to signal broadcast goroutine to stop
-	close(m.events)
+	if m.events != nil {
+		close(m.events)
+		m.events = nil
+	}
 
 	// Close all client Send channels safely
 	for userID, client := range m.clients {
-		// Check if channel is already closed by trying a non-blocking send
+		// Check if channel is already closed by trying a non-blocking receive
 		select {
 		case <-client.Send:
 			// Channel is already closed
