@@ -68,12 +68,53 @@ function createAudioDecoder(onOutput, onError, numberOfChannels = 1) {
         error: onError
     });
 
-    // Configure decoder for Opus without description (raw Opus packets)
-    decoder.configure({
+    // Configure decoder for Opus. For multi-channel Opus some browsers require
+    // an Opus identification header in `description` per WebCodecs spec.
+    const cfg = {
         codec: 'opus',
-        sampleRate: OPUS_SAMPLE_RATE,
-        numberOfChannels: numberOfChannels
-    });
+        sampleRate: OPUS_SAMPLE_RATE
+    };
+        // Always include numberOfChannels; some environments expect it even when
+        // a description OpusHead is provided.
+        cfg.numberOfChannels = numberOfChannels;
+
+        // Attempt to configure the decoder. For multi-channel streams we attach
+        // an OpusHead `description` buffer; some browsers require this. If
+        // configure fails we fall back to a simpler config that omits description
+        // but keeps numberOfChannels so decoding may still work.
+        try {
+            decoder.configure(cfg);
+        } catch (e) {
+            console.warn('AudioDecoder.configure with OpusHead description failed, retrying without description:', e);
+            // Remove description and retry
+            if (cfg.description) delete cfg.description;
+            try {
+                decoder.configure(cfg);
+            } catch (e2) {
+                console.error('AudioDecoder.configure fallback failed:', e2);
+                throw e2;
+            }
+        }
+
+    if (numberOfChannels > 1) {
+        // Build minimal OpusHead identification header (little-endian fields):
+        // "OpusHead" (8 bytes) | version (1) | channels (1) |
+        // pre-skip (uint16 little-endian) | sample rate (uint32 little-endian) |
+        // output gain (uint16 little-endian) | channel mapping (1)
+        // Use pre-skip=312 (common), sampleRate=48000, outputGain=0, mapping=0
+        const desc = new Uint8Array([
+            0x4f, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64, // "OpusHead"
+            0x01, // version
+            numberOfChannels & 0xff,
+            0x38, 0x01, // pre-skip = 312 (0x0138 little-endian)
+            0x80, 0xbb, 0x00, 0x00, // sample rate 48000 (0x0000BB80 little-endian)
+            0x00, 0x00, // output gain
+            0x00 // channel mapping
+        ]);
+        cfg.description = desc.buffer;
+    }
+
+    decoder.configure(cfg);
 
     // Remember configured channel count on the decoder instance so callers
     // can check and recreate the decoder when channel count changes.
