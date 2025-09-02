@@ -85,13 +85,16 @@ function createAudioDecoder(onOutput, onError, numberOfChannels = 1) {
         try {
             decoder.configure(cfg);
         } catch (e) {
-            console.warn('AudioDecoder.configure with OpusHead description failed, retrying without description:', e);
+            const warnMsg = 'AudioDecoder.configure with OpusHead description failed, retrying without description; falling back to simpler config.';
+            console.warn(warnMsg, e);
+            try { addMessage('⚠️ ' + warnMsg); } catch (ignore) {}
             // Remove description and retry
             if (cfg.description) delete cfg.description;
             try {
                 decoder.configure(cfg);
             } catch (e2) {
                 console.error('AudioDecoder.configure fallback failed:', e2);
+                try { addMessage('❌ AudioDecoder configure failed; audio may not play.'); } catch (ignore) {}
                 throw e2;
             }
         }
