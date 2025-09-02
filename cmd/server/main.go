@@ -2125,7 +2125,18 @@ func (s *Server) emitVorbisMeta(channelID string, pkt oggdemux.Packet) {
 	if s.stateManager != nil {
 		s.stateManager.SetChannelMeta(channelID, comments)
 	}
-	s.stateManager.BroadcastEvent(meta)
+	// Attempt to enqueue into the manager's meta worker pool. If enqueue
+	// fails (pool not started or queue full), fall back to direct broadcast
+	// to preserve behavior.
+	enqueued := false
+	if s.stateManager != nil {
+		enqueued = s.stateManager.EnqueueMeta(meta)
+	}
+	if !enqueued {
+		if s.stateManager != nil {
+			s.stateManager.BroadcastEvent(meta)
+		}
+	}
 
 	// (re)start a periodic broadcaster to re-send meta every 30s while stream active
 	go s.startChannelMetaBroadcaster(channelID)
@@ -2161,10 +2172,22 @@ func (s *Server) startChannelMetaBroadcaster(channelID string) {
 					"comments": comments,
 				},
 			}
-			s.stateManager.BroadcastEvent(meta)
+			s.attemptMetaBroadcast(meta)
 		case <-s.ctx.Done():
 			return
 		}
+	}
+}
+
+// attemptMetaBroadcast tries to enqueue a meta event to the manager's meta
+// worker pool and falls back to direct broadcast when necessary. Extracted to
+// reduce cyclomatic complexity in the broadcaster loop.
+func (s *Server) attemptMetaBroadcast(meta *types.PTTEvent) {
+	if s.stateManager == nil {
+		return
+	}
+	if enqueued := s.stateManager.EnqueueMeta(meta); !enqueued {
+		s.stateManager.BroadcastEvent(meta)
 	}
 }
 
@@ -2528,6 +2551,10 @@ func (s *Server) Start() {
 	go s.broadcastEvents()
 	// Start background pruning for recentSeqs to avoid unbounded growth.
 	go s.startRecentSeqsPruner()
+	// Start metadata broadcast worker pool to avoid unbounded goroutine churn
+	if s.stateManager != nil {
+		s.stateManager.StartMetaWorkerPool(s.ctx)
+	}
 }
 
 // startRecentSeqsPruner runs a background goroutine that periodically prunes

@@ -3,7 +3,9 @@ package state
 import (
 	"context"
 	"log"
+	"os"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -17,6 +19,11 @@ type Manager struct {
 	channels              map[string]*types.Channel
 	clients               map[string]*types.WebSocketConnection
 	events                chan *types.PTTEvent
+	// metaJobs is a bounded queue of metadata events processed by a fixed
+	// worker pool to avoid unbounded goroutine creation when many meta
+	// broadcasts occur.
+	metaJobs              chan *types.PTTEvent
+	metaWG                sync.WaitGroup
 	// streamBuffers holds per-channel live Ogg raw stream buffers for HTTP proxying
 	streamBuffers         map[string]*stream.Buffer
 	droppedCriticalEvents int  // Track dropped critical events for monitoring
@@ -27,6 +34,9 @@ type Manager struct {
 const (
 	DefaultEventBufferSize = 1000  // Increased from 100 for better throughput
 	MaxEventBufferSize     = 10000 // Maximum buffer size for high-load scenarios
+	// Meta worker defaults
+	DefaultMetaWorkerCount = 4
+	DefaultMetaQueueSize   = 100
 )
 
 func NewManager() *Manager {
@@ -54,6 +64,84 @@ func NewManagerWithBufferSize(bufferSize int) *Manager {
 		clients:  make(map[string]*types.WebSocketConnection),
 	events:   make(chan *types.PTTEvent, bufferSize),
 	streamBuffers: make(map[string]*stream.Buffer),
+	}
+}
+
+// StartMetaWorkerPool starts a fixed-size pool of workers that will process
+// metadata broadcast jobs enqueued via EnqueueMeta. Worker/queue sizes can be
+// configured via the META_BROADCAST_WORKERS and META_BROADCAST_QUEUE_SIZE
+// environment variables. This method is idempotent.
+func (m *Manager) StartMetaWorkerPool(ctx context.Context) {
+	m.mu.Lock()
+	if m.metaJobs != nil {
+		m.mu.Unlock()
+		return
+	}
+
+	workers := getEnvIntOrDefault("META_BROADCAST_WORKERS", DefaultMetaWorkerCount)
+	queueSize := getEnvIntOrDefault("META_BROADCAST_QUEUE_SIZE", DefaultMetaQueueSize)
+
+	m.metaJobs = make(chan *types.PTTEvent, queueSize)
+	m.mu.Unlock()
+
+	// Start worker goroutines
+	for i := 0; i < workers; i++ {
+		m.metaWG.Add(1)
+		go m.runMetaWorker(ctx)
+	}
+}
+
+// getEnvIntOrDefault parses an environment variable into an int, returning
+// the provided default on error or if unset.
+func getEnvIntOrDefault(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if iv, err := strconv.Atoi(v); err == nil && iv > 0 {
+			return iv
+		}
+	}
+	return def
+}
+
+// runMetaWorker is the loop executed by each meta worker goroutine. Separated
+// out to reduce cyclomatic complexity in StartMetaWorkerPool.
+func (m *Manager) runMetaWorker(ctx context.Context) {
+	defer m.metaWG.Done()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev, ok := <-m.metaJobs:
+			if !ok {
+				return
+			}
+			m.BroadcastEvent(ev)
+		}
+	}
+}
+
+// EnqueueMeta submits a metadata event to the meta worker queue. It returns
+// true if the event was queued, or false if the queue was full or the manager
+// is shutting down. Non-blocking to avoid stalling producers.
+func (m *Manager) EnqueueMeta(event *types.PTTEvent) bool {
+	m.mu.RLock()
+	if m.isShuttingDown || m.metaJobs == nil {
+		m.mu.RUnlock()
+		return false
+	}
+	metaJobs := m.metaJobs
+	m.mu.RUnlock()
+
+	select {
+	case metaJobs <- event:
+		return true
+	default:
+		// Drop on overflow to protect the system; track as a dropped critical
+		// event for visibility (re-using the counter).
+		m.mu.Lock()
+		m.droppedCriticalEvents++
+		m.mu.Unlock()
+		log.Printf("WARNING: meta enqueue dropped due to full queue")
+		return false
 	}
 }
 
