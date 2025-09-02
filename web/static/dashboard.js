@@ -8,7 +8,7 @@ let audioContext = null;
 let mediaStream = null;
 let nextPlayTime = 0;
 let activeAudioSources = new Map(); // Track audio sources by user ID
-let decoderTimestamp = 0;
+let serverTsBaseUs = null; // Base server timestamp (microseconds) to keep JS numbers small
 let audioBuffer = []; // Buffer for smooth playback
 let isBuffering = false;
 let isPlayingBuffer = false; // Track if we're currently playing buffered audio
@@ -18,8 +18,11 @@ let microphonePermission = false;
 // WebCodecs Opus system variables
 let webCodecsEncoder = null;
 let webCodecsDecoder = null;
+let webCodecsDecoderChannels = 1;
 const OPUS_SAMPLE_RATE = 48000;
 const OPUS_BITRATE = 32000;
+// JS-side debug toggle: set localStorage.WT_DEBUG_AUDIO = '1' to enable verbose logs
+const JS_DEBUG_AUDIO = (typeof localStorage !== 'undefined' && localStorage.getItem && localStorage.getItem('WT_DEBUG_AUDIO') === '1');
 
 // Audio buffer configuration constants
 // These values balance latency vs stability for real-time PTT communication:
@@ -36,6 +39,12 @@ const MIN_RECEPTION_DURATION = 0.1; // Minimum duration (seconds) for valid audi
 // Logging configuration
 const AUDIO_CHUNK_LOG_SAMPLE_RATE = 0.05; // Sample rate for audio chunk logging (5% to reduce noise)
 let webCodecsSupported = false;
+// Recent sequence numbers seen from server frames (simple dedupe, bounded)
+const recentSeqs = new Map(); // seq -> timestamp (performance.now())
+const RECENT_SEQS_MAX = 256;
+// Per-user timestamp fallbacks when server timestamps are absent or not progressing
+const lastServerTsByUser = new Map(); // userID -> last server tsNumber
+const localTsByUser = new Map(); // userID -> local microsecond timestamp counter
 
 // Helper function to update DOM elements safely
 function updateElementText(elementId, text) {
@@ -53,18 +62,70 @@ function escapeHtml(text) {
 }
 
 // Helper function to create and configure an AudioDecoder
-function createAudioDecoder(onOutput, onError) {
+function createAudioDecoder(onOutput, onError, numberOfChannels = 1) {
     const decoder = new AudioDecoder({
         output: onOutput,
         error: onError
     });
 
-    // Configure decoder for Opus without description (raw Opus packets)
-    decoder.configure({
+    // Configure decoder for Opus. For multi-channel Opus some browsers require
+    // an Opus identification header in `description` per WebCodecs spec.
+    const cfg = {
         codec: 'opus',
-        sampleRate: OPUS_SAMPLE_RATE,
-        numberOfChannels: 1
-    });
+        sampleRate: OPUS_SAMPLE_RATE
+    };
+        // Always include numberOfChannels; some environments expect it even when
+        // a description OpusHead is provided.
+        cfg.numberOfChannels = numberOfChannels;
+
+        // Attempt to configure the decoder. For multi-channel streams we attach
+        // an OpusHead `description` buffer; some browsers require this. If
+        // configure fails we fall back to a simpler config that omits description
+        // but keeps numberOfChannels so decoding may still work.
+        try {
+            decoder.configure(cfg);
+        } catch (e) {
+            const warnMsg = 'AudioDecoder.configure with OpusHead description failed, retrying without description; falling back to simpler config.';
+            console.warn(warnMsg, e);
+            try { addMessage('⚠️ ' + warnMsg); } catch (ignore) {}
+            // Remove description and retry
+            if (cfg.description) delete cfg.description;
+            try {
+                decoder.configure(cfg);
+            } catch (e2) {
+                console.error('AudioDecoder.configure fallback failed:', e2);
+                try { addMessage('❌ AudioDecoder configure failed; audio may not play.'); } catch (ignore) {}
+                throw e2;
+            }
+        }
+
+    if (numberOfChannels > 1) {
+        // Build minimal OpusHead identification header (little-endian fields):
+        // "OpusHead" (8 bytes) | version (1) | channels (1) |
+        // pre-skip (uint16 little-endian) | sample rate (uint32 little-endian) |
+        // output gain (uint16 little-endian) | channel mapping (1)
+        // Use pre-skip=312 (common), sampleRate=48000, outputGain=0, mapping=0
+        const desc = new Uint8Array([
+            0x4f, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64, // "OpusHead"
+            0x01, // version
+            numberOfChannels & 0xff,
+            0x38, 0x01, // pre-skip = 312 (0x0138 little-endian)
+            0x80, 0xbb, 0x00, 0x00, // sample rate 48000 (0x0000BB80 little-endian)
+            0x00, 0x00, // output gain
+            0x00 // channel mapping
+        ]);
+        cfg.description = desc.buffer;
+    }
+
+    decoder.configure(cfg);
+
+    // Remember configured channel count on the decoder instance so callers
+    // can check and recreate the decoder when channel count changes.
+    try {
+        decoder._numberOfChannels = numberOfChannels;
+    } catch (e) {
+        // Not critical if we can't attach property in some environments
+    }
 
     return decoder;
 }
@@ -119,6 +180,9 @@ let audioStats = {
     lastValidRxBitrate: 0,
     lastValidTxBitrate: 0
 };
+
+// Store latest metadata (Vorbis comments / stream title) per channel
+const channelMeta = new Map(); // channelID -> { comments: string, title: string }
 let statsUpdateInterval = null;
 
 // DOM Elements
@@ -139,7 +203,6 @@ function startTransmissionStats() {
     audioStats.currentTransmitBitrate = 0;
     
     // Stats are always visible now, just update the visual state
-    document.getElementById('transmission-stats').style.opacity = '1';
     document.getElementById('connection-indicator').style.background = '#dc3545'; // Red when transmitting
     
     if (!statsUpdateInterval) {
@@ -187,7 +250,7 @@ function stopReceptionStats() {
         document.getElementById('connection-indicator').style.background = '#28a745'; // Green when idle
     }
     
-    // Keep stats always running for persistent display
+            // reception stopped
     // Don't clear the interval - we want continuous updates
 }
 
@@ -387,7 +450,9 @@ async function initializeWebCodecs() {
             (err) => {
                 addMessage('❌ Decoder error: ' + err.message);
             }
+        , 1
         );
+        webCodecsDecoderChannels = 1;
         
         webCodecsSupported = true;
         addMessage('✅ WebCodecs Opus encoder/decoder initialized successfully.');
@@ -549,6 +614,10 @@ function initializeAudioMixer() {
         audioMixerGain = audioContext.createGain();
         audioMixerGain.gain.value = 0.8; // Set overall volume to prevent clipping
         audioMixerGain.connect(audioContext.destination);
+        
+        // Initialize nextPlayTime to current audio context time
+        nextPlayTime = audioContext.currentTime;
+        
         addMessage('🎚️ Audio mixer initialized');
     }
 }
@@ -587,37 +656,70 @@ async function playDecodedAudio(audioData) {
         const numberOfFrames = audioData.numberOfFrames;
         const numberOfChannels = audioData.numberOfChannels;
         const sampleRate = audioData.sampleRate;
-        
-        // Use more efficient buffer allocation
-        const bufferSize = numberOfFrames * numberOfChannels;
-        const pcmBuffer = new ArrayBuffer(bufferSize * 4); // 4 bytes per float32
-        const pcmData = new Float32Array(pcmBuffer);
-        
-        // Copy all audio data efficiently
-        audioData.copyTo(pcmBuffer, { planeIndex: 0, format: 'f32-planar' });
-        
-        // Extract first channel if multi-channel
-        let monoData = pcmData;
-        if (numberOfChannels > 1) {
-            monoData = new Float32Array(numberOfFrames);
-            for (let i = 0; i < numberOfFrames; i++) {
-                monoData[i] = pcmData[i * numberOfChannels]; // Take first channel
+
+        // Initialize audio context if needed
+        if (!audioContext) {
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        if (audioContext.state === 'suspended') {
+            await audioContext.resume();
+        }
+        if (!audioMixerGain) {
+            initializeAudioMixer();
+        }
+
+        // Create Web Audio buffer directly from AudioData
+        const audioBufferNode = audioContext.createBuffer(numberOfChannels, numberOfFrames, sampleRate);
+
+        // Copy audio data channel-by-channel to ensure proper channel mapping
+        for (let ch = 0; ch < numberOfChannels; ch++) {
+            const channelData = audioBufferNode.getChannelData(ch);
+            try {
+                // Copy planar f32 data directly to each channel
+                audioData.copyTo(channelData, { planeIndex: ch, format: 'f32-planar' });
+            } catch (e) {
+                // Fallback: if planar copy fails, try interleaved and deinterleave
+                const interleaved = new Float32Array(numberOfFrames * numberOfChannels);
+                audioData.copyTo(interleaved, { format: 'f32' });
+                
+                for (let i = 0; i < numberOfFrames; i++) {
+                    channelData[i] = interleaved[i * numberOfChannels + ch] || 0;
+                }
             }
         }
+
+        // Create and schedule audio playback with proper timing
+        const userGain = audioContext.createGain();
+        userGain.gain.value = 0.7; // Conservative volume to prevent clipping
         
-        // Play directly for low latency
-        await playAudioWithMixing(monoData, sampleRate, 'opus-user');
+        const source = audioContext.createBufferSource();
+        source.buffer = audioBufferNode;
+        source.connect(userGain);
+        userGain.connect(audioMixerGain);
+
+        // Use simple immediate playback for real-time audio - no complex buffering
+        // Web Audio will handle the timing internally with its own buffering
+        const currentTime = audioContext.currentTime;
+        const playTime = Math.max(currentTime, nextPlayTime);
         
+        source.start(playTime);
+        
+        // Update next play time based on actual audio duration
+        const frameDuration = numberOfFrames / sampleRate;
+        nextPlayTime = playTime + frameDuration;
+
+        source.onended = () => {
+            userGain.disconnect();
+        };
+
         // Update audio stats with more detailed info
         if (audioData.duration > 0) {
-            const bitrate = (audioData.byteLength * 8) / (audioData.duration / 1000000) / 1000;
+            const bitrate = (numberOfFrames * numberOfChannels * 32) / (audioData.duration / 1000000) / 1000; // Estimate based on f32 PCM
             updateElementText('rx-bitrate', `${bitrate.toFixed(1)} kbps`);
         }
         const channelText = numberOfChannels === 1 ? 'Mono' : `${numberOfChannels}-channel`;
         updateElementText('rx-channels', `${channelText} @ ${sampleRate}Hz`);
 
-        // AudioData cleanup is handled in finally block
-        
     } catch (error) {
         addMessage(`❌ Error playing decoded audio: ${error.message}`);
     } finally {
@@ -644,17 +746,34 @@ async function playAudioWithMixingBuffered(pcmData, sampleRate, userID) {
             initializeAudioMixer();
         }
 
-        if (!pcmData || pcmData.length === 0) return;
+        if (!pcmData) return;
 
-        // Create audio buffer
-        const audioBuffer = audioContext.createBuffer(1, pcmData.length, sampleRate);
-        audioBuffer.getChannelData(0).set(pcmData);
+        // pcmData may be a Float32Array (mono) or an Array of Float32Array (per-channel)
+        let numChannels = 1;
+        let length = 0;
+        if (Array.isArray(pcmData)) {
+            numChannels = pcmData.length;
+            length = pcmData[0].length;
+        } else {
+            numChannels = 1;
+            length = pcmData.length;
+        }
+
+        const audioBufferNode = audioContext.createBuffer(numChannels, length, sampleRate);
+
+        if (numChannels === 1) {
+            audioBufferNode.getChannelData(0).set(pcmData);
+        } else {
+            for (let ch = 0; ch < numChannels; ch++) {
+                audioBufferNode.getChannelData(ch).set(pcmData[ch]);
+            }
+        }
 
         const userGain = audioContext.createGain();
         userGain.gain.value = 0.6; // Conservative volume for buffered playback
 
         const source = audioContext.createBufferSource();
-        source.buffer = audioBuffer;
+        source.buffer = audioBufferNode;
         source.connect(userGain);
         userGain.connect(audioMixerGain);
 
@@ -682,13 +801,16 @@ async function playAudioWithMixing(pcmData, sampleRate, userID) {
             initializeAudioMixer();
         }
 
-        if (!pcmData || pcmData.length === 0) return;
+        if (!pcmData || (Array.isArray(pcmData) ? pcmData.length === 0 : pcmData.length === 0)) return;
 
         // Add to buffer for smooth playback - use consistent structure
+        // Store both pcmData (Float32Array or Array of Float32Array) and channel count
+        const numChannels = Array.isArray(pcmData) ? pcmData.length : 1;
         audioBuffer.push({ 
             data: pcmData, 
             sampleRate: sampleRate, 
             userID: userID,
+            channels: numChannels,
             timestamp: performance.now()
         });
         
@@ -716,10 +838,20 @@ async function processAudioBuffer() {
             
             if (audioBuffer.length === 0) break;
             
-            const { data: pcmData, sampleRate, userID } = audioBuffer.shift();
+            const { data: pcmData, sampleRate, userID, channels } = audioBuffer.shift();
             
-            const audioBufferNode = audioContext.createBuffer(1, pcmData.length, sampleRate);
-            audioBufferNode.getChannelData(0).set(pcmData);
+            const numChannels = channels || (Array.isArray(pcmData) ? pcmData.length : 1);
+            const length = numChannels === 1 ? pcmData.length : pcmData[0].length;
+
+            const audioBufferNode = audioContext.createBuffer(numChannels, length, sampleRate);
+
+            if (numChannels === 1) {
+                audioBufferNode.getChannelData(0).set(pcmData);
+            } else {
+                for (let ch = 0; ch < numChannels; ch++) {
+                    audioBufferNode.getChannelData(ch).set(pcmData[ch]);
+                }
+            }
 
             const userGain = audioContext.createGain();
             userGain.gain.value = 0.8;
@@ -739,8 +871,8 @@ async function processAudioBuffer() {
             
             source.start(nextPlayTime);
             
-            // Update next play time based on audio duration (20ms for Opus frames)
-            const frameDuration = pcmData.length / sampleRate;
+            // Update next play time based on audio duration
+            const frameDuration = length / sampleRate;
             nextPlayTime += frameDuration;
 
             source.onended = () => {
@@ -764,14 +896,14 @@ async function processAudioBuffer() {
 
 async function playReceivedAudio(audioData, userID = 'unknown', metadata) {
     try {
+        // metadata is preferred, but derive format/channels from header if missing
         if (!metadata) {
-            addMessage('⚠️ Received audio data without metadata. Cannot play.');
-            return;
+            metadata = { data: {} };
         }
 
         let pcmData;
-        const format = metadata.data.format;
-        const sampleRate = metadata.data.sample_rate;
+    const format = metadata.data.format;
+    let sampleRate = metadata.data.sample_rate;
         
         // Start reception stats if not already started
         if (!audioStats.receiving) {
@@ -783,22 +915,115 @@ async function playReceivedAudio(audioData, userID = 'unknown', metadata) {
             startReceptionStats();
         }
         
-        // Update reception stats
-        audioStats.receivedBytes += audioData.byteLength || audioData.length || 0;
+        // Parse and strip the server-side 15-byte header (seq:uint32, ts:uint64, channels:uint8, payload_len:uint16)
+        // so we feed raw Opus payloads to WebCodecs. Be robust to ArrayBuffer/Uint8Array/Buffer.
+        let buf;
+        if (audioData instanceof ArrayBuffer) {
+            buf = new Uint8Array(audioData);
+        } else if (audioData instanceof Uint8Array) {
+            buf = audioData;
+        } else {
+            try {
+                buf = new Uint8Array(audioData);
+            } catch (e) {
+                addMessage('⚠️ Received audio in unknown format, skipping');
+                return;
+            }
+        }
+
+        let payloadBuf = buf;
+        // Ensure tsNumber exists even if header parsing is skipped
+        let tsNumber = 0;
+        let seq = 0; // Initialize seq in outer scope for timestamp calculations
+        const HEADER_LEN = 15;
+        if (buf.length >= HEADER_LEN) {
+            const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+            seq = dv.getUint32(0, false);
+            const channelsFromHeader = dv.getUint8(12);
+            const payloadLen = dv.getUint16(13, false); // big-endian
+            // Dedupe by sequence number (helps if server forwards duplicate frames)
+            if (recentSeqs.has(seq)) {
+                if (JS_DEBUG_AUDIO) console.debug('Skipping duplicate seq', seq);
+                return; // ignore duplicate frame
+            }
+            // record seq with timestamp
+            recentSeqs.set(seq, performance.now());
+            // keep map bounded
+            if (recentSeqs.size > RECENT_SEQS_MAX) {
+                // remove oldest entry
+                let oldestKey = null;
+                let oldestVal = Infinity;
+                for (const [k, v] of recentSeqs.entries()) {
+                    if (v < oldestVal) {
+                        oldestVal = v;
+                        oldestKey = k;
+                    }
+                }
+                if (oldestKey !== null) recentSeqs.delete(oldestKey);
+            }
+            // Read server-supplied timestamp (big-endian uint64 microseconds)
+            let tsUs = 0n;
+            if (typeof dv.getBigUint64 === 'function') {
+                try {
+                    tsUs = dv.getBigUint64(4, false);
+                } catch (e) {
+                    // fallback
+                }
+            }
+            if (tsUs === 0n) {
+                // fallback to combining two 32-bit reads
+                const hi = dv.getUint32(4, false);
+                const lo = dv.getUint32(8, false);
+                tsUs = BigInt(hi) << 32n | BigInt(lo);
+            }
+            const tsNumber = Number(tsUs);
+
+            if (JS_DEBUG_AUDIO) {
+                const tsRel = (serverTsBaseUs === null ? 0 : tsNumber - serverTsBaseUs);
+                console.debug('AUDIO IN header:', { channelsFromHeader, payloadLen, bufLen: buf.length, tsUs: tsNumber, tsRel });
+            }
+
+            // Prefer the header-provided channel count when available.
+            // This ensures we recreate the decoder to match the actual
+            // incoming packet channel layout (important for stereo).
+            if (metadata && metadata.data) {
+                if (channelsFromHeader && channelsFromHeader > 0) {
+                    metadata.data.channels = Number(channelsFromHeader);
+                } else if (!metadata.data.channels) {
+                    metadata.data.channels = 1;
+                }
+            }
+
+            // Populate format/sample_rate defaults if missing
+            if (metadata && metadata.data) {
+                if (!metadata.data.format) metadata.data.format = 'opus';
+                if (!metadata.data.sample_rate) metadata.data.sample_rate = 48000;
+            }
+
+            if (buf.length >= HEADER_LEN + payloadLen) {
+                payloadBuf = buf.subarray(HEADER_LEN, HEADER_LEN+payloadLen);
+            } else {
+                // fallback: use remaining bytes as payload if lengths don't match
+                payloadBuf = buf.subarray(HEADER_LEN);
+            }
+        }
+
+        // Update reception stats with actual payload size when possible
+        audioStats.receivedBytes += payloadBuf.byteLength || payloadBuf.length || 0;
         audioStats.lastAudioReceived = performance.now();
 
-        if (format !== 'opus') {
-            addMessage(`⚠️ Non-Opus audio format "${format}" from ${userID}. Only Opus is supported.`);
-            return;
-        }
+    // Validate format, but if missing try to infer from header later
+    // We'll defer strict format validation until after header parsing
         
         if (!webCodecsSupported) {
             addMessage(`⚠️ WebCodecs not supported, skipping audio from ${userID}`);
             return;
         }
 
-        // Ensure decoder is ready and recreate if needed
-        if (!webCodecsDecoder || webCodecsDecoder.state === 'closed' || webCodecsDecoder.state === 'unconfigured') {
+    // Ensure decoder is ready and recreate if needed
+    const expectedChannels = Number(metadata.data && metadata.data.channels ? metadata.data.channels : 1);
+    const currentDecoderChannels = webCodecsDecoder ? webCodecsDecoderChannels : 0;
+    if (!webCodecsDecoder || webCodecsDecoder.state === 'closed' || webCodecsDecoder.state === 'unconfigured' || (currentDecoderChannels && currentDecoderChannels !== expectedChannels)) {
             try {
                 webCodecsDecoder = createAudioDecoder(
                     (audioData) => {
@@ -808,12 +1033,16 @@ async function playReceivedAudio(audioData, userID = 'unknown', metadata) {
                         addMessage(`❌ Decoder error from ${userID}: ${err.message}`);
                         // Reset decoder on error for next attempt
                         webCodecsDecoder = null;
-                    }
+                    },
+                    expectedChannels
                 );
-                
-                addMessage(`🔧 Recreated WebCodecs decoder for ${userID}`);
-                // Reset timestamp and playback timing for new decoder instance
-                decoderTimestamp = 0;
+
+                // Track configured channels globally for reliable comparisons
+                webCodecsDecoderChannels = expectedChannels;
+
+                addMessage(`🔧 Recreated WebCodecs decoder for ${userID} (channels=${expectedChannels})`);
+                // Reset playback timing and server timestamp base for new decoder instance
+                serverTsBaseUs = null;
                 nextPlayTime = 0;
             } catch (err) {
                 addMessage(`❌ Failed to recreate decoder for ${userID}: ${err.message}`);
@@ -834,15 +1063,36 @@ async function playReceivedAudio(audioData, userID = 'unknown', metadata) {
             const estimatedDuration = 20000;
             
             // Create EncodedAudioChunk for WebCodecs decoder with proper timestamp
+            // Use the stripped payload buffer only.
+            const ab = payloadBuf.buffer.slice(payloadBuf.byteOffset, payloadBuf.byteOffset + payloadBuf.byteLength);
+            
+            // For WebCodecs, use incremental timestamps instead of server timestamps
+            // This avoids timing discontinuities and ensures smooth playback
+            const FRAME_DURATION_US = 20000; // 20ms in microseconds for typical Opus frames
+            
+            // Use simple incremental timestamps for WebCodecs decoder
+            // This ensures consistent timing without jumps or discontinuities
+            let decoderTimestamp;
+            if (serverTsBaseUs === null) {
+                serverTsBaseUs = tsNumber;
+                decoderTimestamp = 0;
+            } else {
+                // Calculate expected timestamp based on frame sequence
+                // This provides stable timing for the decoder
+                decoderTimestamp = (seq - Math.floor(serverTsBaseUs / FRAME_DURATION_US)) * FRAME_DURATION_US;
+                
+                // Ensure timestamp always advances
+                if (decoderTimestamp <= 0) {
+                    decoderTimestamp = seq * FRAME_DURATION_US;
+                }
+            }
+            
             const encodedChunk = new EncodedAudioChunk({
                 type: 'key', // Required property for Opus frames
-                timestamp: decoderTimestamp, // Use incrementing timestamp
-                data: audioData,
-                duration: estimatedDuration
+                timestamp: decoderTimestamp, // Use stable incremental timestamp
+                data: ab,
+                duration: FRAME_DURATION_US
             });
-            
-            // Increment timestamp for next chunk based on estimated duration
-            decoderTimestamp += estimatedDuration;
             
             webCodecsDecoder.decode(encodedChunk);
             // Note: decoded audio will be handled in the decoder's output callback
@@ -1022,6 +1272,25 @@ function handleServerEvent(event) {
         case 'heartbeat':
             // Silent heartbeat response
             break;
+
+        case 'meta':
+            // Store Vorbis/OpusTags comments as stream title for the channel
+            try {
+                const comments = event.data && event.data.comments ? String(event.data.comments) : '';
+                let title = '';
+                if (comments) {
+                    // Try a simple heuristic: look for TITLE= or StreamTitle=
+                    const m = comments.match(/TITLE=(.+)/i) || comments.match(/StreamTitle=(.+)/i);
+                    if (m && m[1]) title = m[1].trim();
+                }
+                channelMeta.set(event.channel_id || '', { comments: comments, title: title });
+                addMessage(`🔖 Saved stream metadata for channel ${event.channel_id}: ${title || '(no title)'}`);
+                // Refresh channel list UI to show title
+                updateChannelsList();
+            } catch (e) {
+                console.warn('Failed to process meta event', e);
+            }
+            break;
             
         case 'error':
             // Handle server-side errors with user-friendly messages
@@ -1156,12 +1425,16 @@ function updateChannelsList() {
                         audioInfo = `<div class="audio-info">🎤 ${activeSpeakerCount} speaking</div>`;
                     }
                     
+                    // show stream title if demuxer provided metadata
+                    const meta = channelMeta.get(channel.id) || {};
+                    const titleLine = meta.title ? `<div class="channel-title">${escapeHtml(meta.title)}</div>` : '';
                     return `<div class="channel-card ${isCurrentChannel ? 'active' : ''} ${isTalking ? 'talking' : ''} ${publishOnlyClass}" 
                                  id="channel-card-${channel.id}"
                                  data-publish-only="${isPublishOnly}"
                                  onclick="selectChannel('${channel.id}')">
                                 <div class="channel-status ${isCurrentChannel ? 'active' : ''} ${isTalking ? 'talking' : ''}"></div>
-                                <div class="channel-name">${channel.name}</div>
+                                <div class="channel-name">${escapeHtml(channel.name)}</div>
+                                ${titleLine}
                                 <div class="channel-users">${channel.users.length} users</div>
                                 ${audioInfo}
                                 ${isPublishOnly ? '<div class="publish-only-indicator">Read-Only</div>' : ''}

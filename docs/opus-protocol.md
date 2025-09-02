@@ -123,6 +123,60 @@ Clients should accept frames with variable `payload_len` and use timestamp/seq t
 
 ---
 
+## Operational details added in recent updates
+
+These implementation notes document changes made in the `stereo-streamer` feature branch
+and should be considered part of the transport/operator guide.
+
+- Metadata worker pool (server-side)
+  - The server now provides a bounded worker pool that processes `meta` events before
+    routing them into the main event broadcast channel. This prevents unbounded goroutine
+    creation when many metadata updates arrive from publishers. Configuration:
+    - `META_BROADCAST_WORKERS` (int, default 4): number of meta worker goroutines.
+    - `META_BROADCAST_QUEUE_SIZE` (int, default 100): size of the meta event queue.
+  - Enqueue is non-blocking: if the queue is full a `meta` event will be dropped and
+    a `metaDroppedEvents` counter is incremented for observability.
+
+- Server-side metadata persistence and rebroadcasting
+  - The server persists the last known channel metadata (Vorbis comments) and
+    periodically re-broadcasts it while a publisher for the channel is active.
+  - Clients receive `meta` messages periodically as well as on changes.
+
+- Debug endpoint and access control
+  - A debug endpoint was added at `GET /api/debug/audio` to inspect `recentSeqs` and
+    `lastTsPerChannel` values for a channel. This endpoint is intentionally disabled
+    unless `DEBUG_API_KEY` is explicitly set in the environment. When disabled it returns
+    HTTP 404. When enabled, requests must provide the matching `X-API-Key` header.
+
+- recentSeqs pruning
+  - The server tracks recent sequence numbers per channel to deduplicate frames.
+    To prevent memory growth a background pruner removes old entries periodically.
+    Configuration:
+    - `RECENT_SEQ_TTL_SECONDS` (int, default 5)
+    - `RECENT_SEQ_PRUNE_INTERVAL_SECONDS` (int, default 5)
+
+- Client/streamer utilities added
+  - `SendMeta(ctx, comments string)` — a convenience method on the streaming client
+    that sends a `meta` JSON event to the server (and is used by demuxers when
+    Vorbis comments / titles change).
+  - `StreamInfinite(ctx, interval, chunkSize)` — streams test audio indefinitely
+    until the context is cancelled (CLI `-duration 0` now means infinite streaming).
+
+- Stats & observability
+  - `GetStats()` now exposes `meta_worker_count` and `meta_dropped_events` so operators
+    can monitor meta backpressure and worker utilization.
+
+Notes on behavior and defaults
+- By default the server will drop non-critical events when its buffers are full. Critical
+  events use a short timeout to avoid deadlocks.
+- The meta worker pool trades off potential drop of metadata under overload for system
+  stability. In typical deployments the queue defaults are sufficient; tune via env vars
+  when publishers are bursty.
+
+---
+
+---
+
 ## Publisher responsibilities (demux on the client)
 
 Publishers that ingest container formats (Ogg/Opus, WebM, etc.) should:

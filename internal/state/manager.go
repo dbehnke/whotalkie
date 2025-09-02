@@ -3,7 +3,9 @@ package state
 import (
 	"context"
 	"log"
+	"os"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -12,11 +14,20 @@ import (
 )
 
 type Manager struct {
-	mu                    sync.RWMutex
-	users                 map[string]*types.User
-	channels              map[string]*types.Channel
-	clients               map[string]*types.WebSocketConnection
-	events                chan *types.PTTEvent
+	mu       sync.RWMutex
+	users    map[string]*types.User
+	channels map[string]*types.Channel
+	clients  map[string]*types.WebSocketConnection
+	events   chan *types.PTTEvent
+	// metaJobs is a bounded queue of metadata events processed by a fixed
+	// worker pool to avoid unbounded goroutine creation when many meta
+	// broadcasts occur.
+	metaJobs chan *types.PTTEvent
+	metaWG   sync.WaitGroup
+	// metaWorkerCount tracks currently active meta workers. Protected by mu.
+	metaWorkerCount int
+	// metaDroppedEvents counts how many meta events were dropped due to full queue.
+	metaDroppedEvents int
 	// streamBuffers holds per-channel live Ogg raw stream buffers for HTTP proxying
 	streamBuffers         map[string]*stream.Buffer
 	droppedCriticalEvents int  // Track dropped critical events for monitoring
@@ -27,15 +38,18 @@ type Manager struct {
 const (
 	DefaultEventBufferSize = 1000  // Increased from 100 for better throughput
 	MaxEventBufferSize     = 10000 // Maximum buffer size for high-load scenarios
+	// Meta worker defaults
+	DefaultMetaWorkerCount = 4
+	DefaultMetaQueueSize   = 100
 )
 
 func NewManager() *Manager {
 	return &Manager{
-		users:    make(map[string]*types.User),
-		channels: make(map[string]*types.Channel),
-		clients:  make(map[string]*types.WebSocketConnection),
-	events:   make(chan *types.PTTEvent, DefaultEventBufferSize),
-	streamBuffers: make(map[string]*stream.Buffer),
+		users:         make(map[string]*types.User),
+		channels:      make(map[string]*types.Channel),
+		clients:       make(map[string]*types.WebSocketConnection),
+		events:        make(chan *types.PTTEvent, DefaultEventBufferSize),
+		streamBuffers: make(map[string]*stream.Buffer),
 	}
 }
 
@@ -49,12 +63,114 @@ func NewManagerWithBufferSize(bufferSize int) *Manager {
 	}
 
 	return &Manager{
-		users:    make(map[string]*types.User),
-		channels: make(map[string]*types.Channel),
-		clients:  make(map[string]*types.WebSocketConnection),
-	events:   make(chan *types.PTTEvent, bufferSize),
-	streamBuffers: make(map[string]*stream.Buffer),
+		users:         make(map[string]*types.User),
+		channels:      make(map[string]*types.Channel),
+		clients:       make(map[string]*types.WebSocketConnection),
+		events:        make(chan *types.PTTEvent, bufferSize),
+		streamBuffers: make(map[string]*stream.Buffer),
 	}
+}
+
+// StartMetaWorkerPool starts a fixed-size pool of workers that will process
+// metadata broadcast jobs enqueued via EnqueueMeta. Worker/queue sizes can be
+// configured via the META_BROADCAST_WORKERS and META_BROADCAST_QUEUE_SIZE
+// environment variables. This method is idempotent.
+func (m *Manager) StartMetaWorkerPool(ctx context.Context) {
+	m.mu.Lock()
+	if m.metaJobs != nil {
+		m.mu.Unlock()
+		return
+	}
+
+	workers := getEnvIntOrDefault("META_BROADCAST_WORKERS", DefaultMetaWorkerCount)
+	queueSize := getEnvIntOrDefault("META_BROADCAST_QUEUE_SIZE", DefaultMetaQueueSize)
+
+	m.metaJobs = make(chan *types.PTTEvent, queueSize)
+	// record the expected worker count for observability
+	m.metaWorkerCount = workers
+	m.mu.Unlock()
+
+	// Start worker goroutines
+	for i := 0; i < workers; i++ {
+		m.metaWG.Add(1)
+		go m.runMetaWorker(ctx)
+	}
+}
+
+// getEnvIntOrDefault parses an environment variable into an int, returning
+// the provided default on error or if unset.
+func getEnvIntOrDefault(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if iv, err := strconv.Atoi(v); err == nil && iv > 0 {
+			return iv
+		}
+	}
+	return def
+}
+
+// runMetaWorker is the loop executed by each meta worker goroutine. Separated
+// out to reduce cyclomatic complexity in StartMetaWorkerPool.
+func (m *Manager) runMetaWorker(ctx context.Context) {
+	defer func() {
+		// decrement active worker counter
+		m.mu.Lock()
+		if m.metaWorkerCount > 0 {
+			m.metaWorkerCount--
+		}
+		m.mu.Unlock()
+		m.metaWG.Done()
+	}()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev, ok := <-m.metaJobs:
+			if !ok {
+				return
+			}
+			m.BroadcastEvent(ev)
+		}
+	}
+}
+
+// EnqueueMeta submits a metadata event to the meta worker queue. It returns
+// true if the event was queued, or false if the queue was full or the manager
+// is shutting down. Non-blocking to avoid stalling producers.
+func (m *Manager) EnqueueMeta(event *types.PTTEvent) bool {
+	m.mu.RLock()
+	if m.isShuttingDown || m.metaJobs == nil {
+		m.mu.RUnlock()
+		return false
+	}
+	metaJobs := m.metaJobs
+	m.mu.RUnlock()
+
+	select {
+	case metaJobs <- event:
+		return true
+	default:
+		// Drop on overflow to protect the system; track as a dropped meta
+		// event for visibility.
+		m.mu.Lock()
+		m.metaDroppedEvents++
+		m.mu.Unlock()
+		log.Printf("WARNING: meta enqueue dropped due to full queue")
+		return false
+	}
+}
+
+// MetaWorkerCount returns the currently active number of meta workers.
+func (m *Manager) MetaWorkerCount() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.metaWorkerCount
+}
+
+// MetaDropped returns the number of meta events dropped due to queue overflow.
+func (m *Manager) MetaDropped() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.metaDroppedEvents
 }
 
 // GetOrCreateStreamBuffer returns an existing buffer for the channel or creates one.
@@ -65,7 +181,7 @@ func (m *Manager) GetOrCreateStreamBuffer(channelID string) *stream.Buffer {
 		return b
 	}
 	// default buffer size 1MB
-	b := stream.NewBuffer(1<<20)
+	b := stream.NewBuffer(1 << 20)
 	m.streamBuffers[channelID] = b
 	return b
 }
@@ -87,7 +203,6 @@ func (m *Manager) CloseStreamBuffer(channelID string) {
 		delete(m.streamBuffers, channelID)
 	}
 }
-
 
 func (m *Manager) AddUser(user *types.User) {
 	m.mu.Lock()
@@ -232,6 +347,16 @@ func (m *Manager) GetOrCreateChannel(channelID, name string) *types.Channel {
 
 	m.channels[channelID] = channel
 	return channel
+}
+
+// SetChannelMeta stores stream metadata/comments (e.g., Vorbis comments) on the channel.
+// This is used by the server to persist and periodically re-broadcast metadata for listeners.
+func (m *Manager) SetChannelMeta(channelID string, comments string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if ch, ok := m.channels[channelID]; ok {
+		ch.Description = comments
+	}
 }
 
 func (m *Manager) GetAllChannels() []*types.Channel {
@@ -431,29 +556,55 @@ func (m *Manager) GetStats() types.ServerStats {
 		DroppedCriticalEvents: m.droppedCriticalEvents,
 		EventBufferLength:     eventBufferLen,
 		EventBufferCapacity:   eventBufferCap,
+		MetaWorkerCount:       m.metaWorkerCount,
+		MetaDroppedEvents:     m.metaDroppedEvents,
 	}
 }
 
 // Shutdown gracefully closes the event channel and cleans up resources
 func (m *Manager) Shutdown() {
+	// First, mark we're shutting down and take ownership of the metaJobs
+	// channel so we can close it and wait for workers without holding the
+	// manager lock (workers may call BroadcastEvent which acquires locks).
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	// Check if we're already shutting down to prevent race conditions
 	if m.isShuttingDown {
+		m.mu.Unlock()
 		log.Printf("Shutdown already in progress, ignoring duplicate call")
 		return
 	}
-
-	// Set shutdown flag first
 	m.isShuttingDown = true
 
+	// Steal the metaJobs channel reference so we can close it without holding
+	// the lock and avoid races with EnqueueMeta (which checks isShuttingDown).
+	var metaJobs chan *types.PTTEvent
+	if m.metaJobs != nil {
+		metaJobs = m.metaJobs
+		m.metaJobs = nil
+	}
+	m.mu.Unlock()
+
+	// Close metaJobs and wait for workers to exit. Do this before closing the
+	// primary events channel because workers call BroadcastEvent which will
+	// attempt to send into m.events; closing m.events first would cause a
+	// panic in the workers.
+	if metaJobs != nil {
+		close(metaJobs)
+		m.metaWG.Wait()
+	}
+
+	// Now acquire lock to close remaining resources and the events channel.
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	// Close event channel to signal broadcast goroutine to stop
-	close(m.events)
+	if m.events != nil {
+		close(m.events)
+		m.events = nil
+	}
 
 	// Close all client Send channels safely
 	for userID, client := range m.clients {
-		// Check if channel is already closed by trying a non-blocking send
+		// Check if channel is already closed by trying a non-blocking receive
 		select {
 		case <-client.Send:
 			// Channel is already closed

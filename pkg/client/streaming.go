@@ -2,10 +2,17 @@ package client
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
+	"errors"
+	"strings"
 	"time"
+	"log"
+
+	"whotalkie/internal/oggdemux"
 )
 
 // StreamingClient extends StreamClient with convenient streaming utilities
@@ -130,6 +137,28 @@ func (c *StreamingClient) StreamForDuration(ctx context.Context, duration time.D
 	}
 }
 
+// StreamInfinite streams test audio indefinitely until context is cancelled
+func (c *StreamingClient) StreamInfinite(ctx context.Context, interval time.Duration, chunkSize int) error {
+	if err := c.StartStreaming(ctx); err != nil {
+		return err
+	}
+	defer func() { _ = c.StopStreaming(ctx) }()
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if err := c.SendTestAudio(ctx, chunkSize); err != nil {
+				return fmt.Errorf("error sending test audio: %w", err)
+			}
+		}
+	}
+}
+
 // StreamFromReader streams audio data from an io.Reader (e.g., stdin)
 func (c *StreamingClient) StreamFromReader(ctx context.Context, reader io.Reader, chunkSize int) error {
 	if err := c.StartStreaming(ctx); err != nil {
@@ -137,32 +166,218 @@ func (c *StreamingClient) StreamFromReader(ctx context.Context, reader io.Reader
 	}
 	defer func() { _ = c.StopStreaming(ctx) }()
 
-	// Stream raw bytes (e.g., OGG container) directly to the server so the
-	// server can perform demuxing. This matches the server's publish-only
-	// pipeline which expects OGG bytes when publish-only is used with stdin.
 	bufReader := bufio.NewReader(reader)
 	buffer := make([]byte, chunkSize)
 
+	pr, pw := io.Pipe()
+	c.startDemuxerForMeta(ctx, pr)
+
+	return c.streamLoop(ctx, bufReader, buffer, pw)
+}
+
+func (c *StreamingClient) startDemuxerForMeta(ctx context.Context, pr *io.PipeReader) {
+	// Run demuxer loop in a goroutine. On non-EOF errors the demuxer will
+	// log and retry with backoff so metadata extraction continues when
+	// transient parse/read errors occur. If the pipe reader is closed or EOF
+	// is reached, the goroutine will exit.
+	go func() {
+		var lastTitle string
+		backoff := time.Second
+		for {
+			demux := oggdemux.New(pr)
+			for {
+				page, err := demux.NextPage()
+				if err != nil {
+					if errors.Is(err, io.EOF) {
+						// clean end of stream
+						log.Printf("demuxer: EOF, stopping metadata goroutine")
+						return
+					}
+					log.Printf("demuxer: error reading page: %v; will retry", err)
+					break // break inner loop -> recreate demux and retry after backoff
+				}
+				if page == nil {
+					continue
+				}
+				c.processPageForMeta(ctx, page, &lastTitle)
+			}
+
+			// wait before retrying; exit early if context cancelled
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+				// exponential backoff capped at 30s
+				if backoff < 30*time.Second {
+					backoff *= 2
+				}
+				continue
+			}
+		}
+	}()
+}
+
+func (c *StreamingClient) processPageForMeta(ctx context.Context, page *oggdemux.Page, lastTitle *string) {
+	for _, pkt := range page.Packets {
+		if pkt.IsVorbisComment {
+			c.handleVorbisComment(ctx, pkt.Data, lastTitle)
+		}
+	}
+}
+
+func (c *StreamingClient) handleVorbisComment(ctx context.Context, data []byte, lastTitle *string) {
+	title := parseOpusTagsTitle(data)
+	sendVal := c.getSendValue(title, data)
+	
+	if sendVal != *lastTitle {
+		*lastTitle = sendVal
+		_ = c.SendMeta(ctx, sendVal)
+	}
+}
+
+func (c *StreamingClient) getSendValue(title string, data []byte) string {
+	if title != "" {
+		return title
+	}
+	return string(data)
+}
+
+func (c *StreamingClient) streamLoop(ctx context.Context, bufReader *bufio.Reader, buffer []byte, pw *io.PipeWriter) error {
+	defer func() {
+		if err := pw.Close(); err != nil {
+			// best-effort log; streaming is ending anyway
+			log.Printf("failed to close demux pipe writer: %v", err)
+		}
+	}()
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
-			n, err := bufReader.Read(buffer)
-			if err != nil {
-				if err == io.EOF {
-					return nil // End of stream
-				}
-				return fmt.Errorf("error reading from stream: %w", err)
-			}
-
-			if n > 0 {
-				// Send raw chunk bytes (container data) to server. Server will
-				// write these into its demux pipe and parse OGG pages itself.
-				if err := c.SendOpusData(ctx, buffer[:n]); err != nil {
-					return fmt.Errorf("error sending chunk to server: %w", err)
-				}
+			if err := c.processNextChunk(ctx, bufReader, buffer, pw); err != nil {
+				return err
 			}
 		}
 	}
+}
+
+func (c *StreamingClient) processNextChunk(ctx context.Context, bufReader *bufio.Reader, buffer []byte, pw *io.PipeWriter) error {
+	n, err := bufReader.Read(buffer)
+	if err != nil {
+		return c.handleReadError(err)
+	}
+
+	if n > 0 {
+		return c.sendChunkData(ctx, buffer[:n], pw)
+	}
+	return nil
+}
+
+func (c *StreamingClient) handleReadError(err error) error {
+	if err == io.EOF {
+		return nil
+	}
+	return fmt.Errorf("error reading from stream: %w", err)
+}
+
+func (c *StreamingClient) sendChunkData(ctx context.Context, data []byte, pw *io.PipeWriter) error {
+	_, _ = pw.Write(data)
+	
+	if err := c.SendOpusData(ctx, data); err != nil {
+		return fmt.Errorf("error sending chunk to server: %w", err)
+	}
+	return nil
+}
+
+// parseOpusTagsTitle parses an OpusTags packet (Vorbis comments) and
+// returns the first TITLE comment value it finds (case-insensitive), or
+// empty string if none present.
+func parseOpusTagsTitle(data []byte) string {
+	if !isValidOpusTagsData(data) {
+		return ""
+	}
+	
+	r := bytes.NewReader(data[8:])
+	if !skipVendorString(r) {
+		return ""
+	}
+	
+	listLen, ok := readListLength(r)
+	if !ok {
+		return ""
+	}
+	
+	return findTitleInComments(r, listLen)
+}
+
+func isValidOpusTagsData(data []byte) bool {
+	if len(data) < 16 {
+		return false
+	}
+	return string(data[0:8]) == "OpusTags"
+}
+
+func skipVendorString(r *bytes.Reader) bool {
+	var vendorLen uint32
+	if err := binary.Read(r, binary.LittleEndian, &vendorLen); err != nil {
+		return false
+	}
+	
+	if int(vendorLen) > r.Len() {
+		return false
+	}
+	
+	_, err := r.Seek(int64(vendorLen), io.SeekCurrent)
+	return err == nil
+}
+
+func readListLength(r *bytes.Reader) (uint32, bool) {
+	var listLen uint32
+	err := binary.Read(r, binary.LittleEndian, &listLen)
+	return listLen, err == nil
+}
+
+func findTitleInComments(r *bytes.Reader, listLen uint32) string {
+	for i := uint32(0); i < listLen; i++ {
+		comment, ok := readNextComment(r)
+		if !ok {
+			return ""
+		}
+		
+		if title := extractTitleFromComment(comment); title != "" {
+			return title
+		}
+	}
+	return ""
+}
+
+func readNextComment(r *bytes.Reader) (string, bool) {
+	var clen uint32
+	if err := binary.Read(r, binary.LittleEndian, &clen); err != nil {
+		return "", false
+	}
+	
+	if int(clen) > r.Len() {
+		return "", false
+	}
+	
+	buf := make([]byte, clen)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return "", false
+	}
+	
+	return string(buf), true
+}
+
+func extractTitleFromComment(comment string) string {
+	parts := strings.SplitN(comment, "=", 2)
+	if len(parts) != 2 {
+		return ""
+	}
+	
+	if strings.EqualFold(strings.TrimSpace(parts[0]), "TITLE") {
+		return strings.TrimSpace(parts[1])
+	}
+	
+	return ""
 }
