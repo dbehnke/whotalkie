@@ -11,10 +11,22 @@ import (
 
 func TestMetaWorkerShutdownAndDrops(t *testing.T) {
 	// Configure a tiny pool for the test
-	os.Setenv("META_BROADCAST_WORKERS", "1")
-	os.Setenv("META_BROADCAST_QUEUE_SIZE", "1")
-	defer os.Unsetenv("META_BROADCAST_WORKERS")
-	defer os.Unsetenv("META_BROADCAST_QUEUE_SIZE")
+	if err := os.Setenv("META_BROADCAST_WORKERS", "1"); err != nil {
+		t.Fatalf("failed to set env META_BROADCAST_WORKERS: %v", err)
+	}
+	if err := os.Setenv("META_BROADCAST_QUEUE_SIZE", "1"); err != nil {
+		t.Fatalf("failed to set env META_BROADCAST_QUEUE_SIZE: %v", err)
+	}
+	defer func() {
+		if err := os.Unsetenv("META_BROADCAST_WORKERS"); err != nil {
+			t.Fatalf("failed to unset env META_BROADCAST_WORKERS: %v", err)
+		}
+	}()
+	defer func() {
+		if err := os.Unsetenv("META_BROADCAST_QUEUE_SIZE"); err != nil {
+			t.Fatalf("failed to unset env META_BROADCAST_QUEUE_SIZE: %v", err)
+		}
+	}()
 
 	m := NewManager()
 
